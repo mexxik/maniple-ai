@@ -26,7 +26,7 @@ bool FManipleTritonSmokeTest::RunTest(const FString& Parameters)
 	const TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("ManipleInference"));
 	if (!TestTrue(TEXT("plugin found"), Plugin.IsValid())) return false;
 	FString Json;
-	if (!TestTrue(TEXT("reference json loads"), FFileHelper::LoadFileToString(Json, *FPaths::Combine(Plugin->GetBaseDir(), TEXT("Resources/policy_mlp_ref.json"))))) return false;
+	if (!TestTrue(TEXT("reference json loads"), FFileHelper::LoadFileToString(Json, *FPaths::Combine(Plugin->GetBaseDir(), TEXT("Resources/policy_ref.json"))))) return false;
 	TSharedPtr<FJsonObject> Ref;
 	if (!TestTrue(TEXT("reference json parses"), FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(Json), Ref) && Ref.IsValid())) return false;
 	const FString Model = Ref->GetStringField(TEXT("model"));

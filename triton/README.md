@@ -2,7 +2,7 @@
 
     docker compose up -d
     curl -s -o /dev/null -w "%{http_code}\n" localhost:8000/v2/health/ready     # 200
-    curl -s localhost:8000/v2/models/policy_mlp | jq
+    curl -s localhost:8000/v2/models/lyra_policy | jq
     # model artifacts are produced by external scripts (not in this repo)
     docker compose logs -f triton
     docker compose down
