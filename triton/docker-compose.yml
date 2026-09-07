@@ -1,0 +1,26 @@
+services:
+  triton:
+    image: nvcr.io/nvidia/tritonserver:26.07-py3
+    container_name: maniple-triton
+    command: >
+      tritonserver --model-repository=/models
+      --model-control-mode=poll --repository-poll-secs=5
+      --log-verbose=1
+    volumes:
+      - ./model_repository:/models
+    ports:
+      - "8000:8000"   # HTTP (KServe v2)
+      - "8001:8001"   # gRPC
+      - "8002:8002"   # Prometheus metrics
+    shm_size: "1g"
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped

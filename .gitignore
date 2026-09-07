@@ -1,4 +1,4 @@
-# Unreal
+# Unreal build output
 **/Binaries/
 **/Intermediate/
 **/Saved/
@@ -8,10 +8,17 @@
 compile_commands.json
 out/
 
-# Python
-__pycache__/
-*.pyc
-.venv/
+# Model artifacts: never in git, filled by external scripts
+*.onnx
+*.plan
+*.engine
+*.trt
+*.pt
+*.pth
+*.safetensors
+*.gguf
+*.npz
+triton/model_repository/*/[0-9]*/
 
 # misc
 .DS_Store

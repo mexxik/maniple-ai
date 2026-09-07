@@ -1,0 +1,14 @@
+name: "policy_mlp"
+platform: "onnxruntime_onnx"
+max_batch_size: 1024
+input [
+  { name: "obs", data_type: TYPE_FP32, dims: [ 32 ] }
+]
+output [
+  { name: "action", data_type: TYPE_FP32, dims: [ 8 ] }
+]
+dynamic_batching {
+  preferred_batch_size: [ 64, 256, 1024 ]
+  max_queue_delay_microseconds: 500
+}
+instance_group [ { count: 1, kind: KIND_GPU } ]

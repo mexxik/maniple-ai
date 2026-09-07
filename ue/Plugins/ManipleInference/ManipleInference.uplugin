@@ -1,0 +1,20 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "0.1.0",
+	"FriendlyName": "Maniple Inference",
+	"Description": "ML inference for Unreal Engine backed by NVIDIA Triton Inference Server (KServe v2 HTTP client).",
+	"Category": "AI",
+	"CreatedBy": "maniple-ai",
+	"CreatedByURL": "https://github.com/mexxik/maniple-ai",
+	"CanContainContent": false,
+	"IsBetaVersion": true,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "ManipleInference",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		}
+	]
+}
