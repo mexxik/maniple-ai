@@ -5,7 +5,7 @@ PPO runs inside Triton (`triton/model_repository/ppo_train`), actions come from 
 
 ## Setup
 
-    python -m venv .venv
+    python3 -m venv .venv
     .venv/bin/pip install -r requirements.txt
 
     cd ../triton && docker compose up -d && cd ../gym     # server on localhost:8001 (gRPC)
@@ -22,6 +22,9 @@ PPO runs inside Triton (`triton/model_repository/ppo_train`), actions come from 
     .venv/bin/python run.py --env LunarLander-v3 --name lander --agents 32 --steps 50000 --net medium --rollout 8192
     .venv/bin/python run.py --env LunarLander-v3 --name lander2 --hidden 512,512,256 --activation relu --layernorm
 
+    # keep the cart near the centre: quadratic reward penalty, 0 at the centre, --center-penalty at the rail
+    .venv/bin/python run.py --env CartPole-v1 --name cartpole_centered --steps 20000 --center-penalty 0.1
+
     # keep training an existing policy with the spec it was created with (network/PPO flags are ignored)
     .venv/bin/python run.py --env CartPole-v1 --name cartpole --steps 4000 --resume
 
@@ -32,7 +35,7 @@ Options (`run.py --help` lists them all):
 
 | group | flags |
 |---|---|
-| run | `--agents` parallel envs, `--steps` per env, `--no-explore` greedy actions |
+| run | `--agents` parallel envs, `--steps` per env, `--no-explore` greedy actions, `--center-penalty` (CartPole) |
 | network | `--net auto\|small\|medium\|large\|custom`, `--hidden 512,512` (custom), `--activation tanh\|relu\|elu\|gelu`, `--layernorm`, `--shared-critic`, `--no-normalize-obs` |
 | ppo | `--rollout`, `--epochs`, `--minibatch`, `--lr`, `--gamma`, `--entropy`, `--max-lag` |
 
@@ -41,10 +44,14 @@ A policy name keeps the spec it was created with: changing network or PPO option
 rejected, use a new name (or delete the policy, see below). The resolved network is printed at start and is in
 every `status`.
 
+`--center-penalty` shapes the reward on the client, before it is sent to the trainer: the cost is
+`coef * (position / 2.4)^2`, so at `0.1` a cart parked at the rail earns 0.9 per step instead of 1.0. Reported
+returns stay on the true environment reward, so they remain comparable to unshaped runs.
+
 ## Play
 
     # live window on your display, greedy policy
-    DISPLAY=:0 .venv/bin/python play.py --env Pendulum-v1 --name pendulum --episodes 5
+    DISPLAY=:0 .venv/bin/python play.py --env CartPole-v1 --name cartpole_centered --episodes 5
 
     # headless, write an mp4
     .venv/bin/python play.py --env CartPole-v1 --name cartpole --episodes 3 --video cartpole.mp4

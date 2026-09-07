@@ -29,6 +29,12 @@ def parse_args():
     parser.add_argument("--steps", type=int, default=3000, help="environment steps per agent")
     parser.add_argument("--no-explore", action="store_true", help="act greedily (evaluation only)")
     parser.add_argument(
+        "--center-penalty",
+        type=float,
+        default=0.0,
+        help="CartPole only: subtract this much reward when the cart sits at the rail (0 = off)",
+    )
+    parser.add_argument(
         "--resume", action="store_true", help="continue an existing policy with its stored spec"
     )
 
@@ -88,6 +94,11 @@ def make_spec(envs, args):
     return {"obs": {"dim": obs_dim}, "action": action, "net": net, "ppo": ppo}
 
 
+def center_penalty(obs, coef, threshold):
+    """Quadratic cost on how far the cart has drifted: 0 at the centre, `coef` at the rail."""
+    return coef * (obs[:, 0] / threshold) ** 2
+
+
 def to_env_action(action, action_index, action_space):
     """Translate the server's action tensor into what env.step() expects."""
     if action_space["type"] == "discrete":
@@ -100,6 +111,9 @@ def main():
 
     envs = gym.vector.SyncVectorEnv([lambda: gym.make(args.env) for _ in range(args.agents)])
     agent = TritonAgent(args.url, args.name)
+
+    # the rail the cart is allowed to reach before the episode ends (CartPole: 2.4)
+    x_threshold = float(getattr(envs.envs[0].unwrapped, "x_threshold", 2.4))
 
     spec = make_spec(envs, args)
     if args.resume:
@@ -136,10 +150,16 @@ def main():
         )
         done = np.logical_or(terminated, truncated)
 
+        # the trainer learns from the shaped reward; the progress line below stays on the true one
+        shaped_reward = reward
+        if args.center_penalty:
+            position = next_obs.reshape(args.agents, -1)
+            shaped_reward = reward - center_penalty(position, args.center_penalty, x_threshold)
+
         status = agent.observe(
             obs=obs_batch,
             action=action,
-            reward=reward,
+            reward=shaped_reward,
             done=done,
             agent_id=agent_ids,
             episode_id=episode_ids,
