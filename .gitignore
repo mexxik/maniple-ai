@@ -1,0 +1,17 @@
+# Unreal
+**/Binaries/
+**/Intermediate/
+**/Saved/
+**/DerivedDataCache/
+**/.vscode/
+*.code-workspace
+compile_commands.json
+out/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# misc
+.DS_Store
