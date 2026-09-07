@@ -11,7 +11,7 @@ enum class EManipleBrain : uint8
 
 /**
  * Runtime behaviour, all from the command line so nothing changes unless asked:
- *   -ManipleBrain=none|random|triton   -ManipleModel=lyra_policy   -ManipleTritonUrl=http://localhost:8000
+ *   -ManipleBrain=none|random|triton   -ManipleModel=lyra_policy   -ManipleTritonUrl=localhost:8001
  *   -ManipleBots=all|N                 -ManipleHz=10
  *   -ManipleBatch=1|0 (client-side batching: one request per tick for all agents, or one per agent)
  *   -ManipleSpawnBots=N (spawn N extra bots through Lyra's bot creation component, for scaling tests)
@@ -20,7 +20,7 @@ struct MANIPLELYRA_API FManipleBotConfig
 {
 	EManipleBrain Brain = EManipleBrain::None;
 	FString Model = TEXT("lyra_policy");
-	FString TritonUrl = TEXT("http://localhost:8000");
+	FString TritonUrl = TEXT("localhost:8001");
 	int32 MaxBots = -1;        // -1 = all
 	float DecisionHz = 10.f;
 	bool bBatch = true;

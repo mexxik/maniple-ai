@@ -8,8 +8,6 @@
 #include "Dom/JsonObject.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
-#include "HttpModule.h"
-#include "HttpManager.h"
 #include "HAL/PlatformTime.h"
 #include "HAL/PlatformProcess.h"
 #include "ManipleTritonClient.h"
@@ -23,7 +21,7 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(FManipleTritonBatchTest, "Maniple.Triton.Batch"
 
 bool FManipleTritonBatchTest::RunTest(const FString& Parameters)
 {
-	FString Url = TEXT("http://localhost:8000");
+	FString Url = TEXT("localhost:8001");
 	FParse::Value(FCommandLine::Get(), TEXT("ManipleTritonUrl="), Url);
 
 	const TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("ManipleInference"));
@@ -55,7 +53,7 @@ bool FManipleTritonBatchTest::RunTest(const FString& Parameters)
 	if (!TestTrue(TEXT("flush sends"), Batch.Flush([&](const FManipleInferResult& R, int32 Rows) { bBatchDone = true; BatchMs = R.LatencyMs; }))) return false;
 	TestEqual(TEXT("pending cleared"), Batch.NumPending(), 0);
 	const double Deadline = FPlatformTime::Seconds() + 6.0;
-	while (!bBatchDone && FPlatformTime::Seconds() < Deadline) { FHttpModule::Get().GetHttpManager().Tick(0.01f); FPlatformProcess::Sleep(0.001f); }
+	while (!bBatchDone && FPlatformTime::Seconds() < Deadline) { Client->PumpCompletions(); FPlatformProcess::Sleep(0.0005f); }
 	if (!TestTrue(TEXT("batch completed"), bBatchDone)) return false;
 	TestEqual(TEXT("all rows called back"), Done, RefBatch);
 	TestEqual(TEXT("no row failed"), Failed, 0);

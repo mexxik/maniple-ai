@@ -2,7 +2,7 @@
 
 #include "CoreMinimal.h"
 
-/** A dense tensor in KServe v2 terms: name, shape, datatype string ("FP32", "INT64", ...), raw little-endian bytes. */
+/** A dense tensor in Triton terms: name, shape, datatype string ("FP32", "INT64", ...), raw little-endian bytes. */
 struct MANIPLEINFERENCE_API FManipleTensor
 {
 	FString Name;
@@ -22,7 +22,7 @@ struct MANIPLEINFERENCE_API FManipleTensor
 struct MANIPLEINFERENCE_API FManipleInferResult
 {
 	bool bSuccess = false;
-	int32 HttpStatus = 0;
+	int32 StatusCode = 0;   // grpc::StatusCode (0 = OK)
 	FString Error;
 	FString ModelName;
 	FString ModelVersion;

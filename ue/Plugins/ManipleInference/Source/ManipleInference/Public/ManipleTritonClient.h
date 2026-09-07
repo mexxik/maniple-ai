@@ -4,38 +4,41 @@
 #include "ManipleInferenceTypes.h"
 
 /**
- * Minimal Triton client speaking the KServe v2 inference protocol over HTTP,
- * with the binary tensor extension (raw bytes, no JSON number arrays).
+ * Triton client over gRPC (GRPCInferenceService). One channel per client; requests use
+ * raw_input_contents / raw_output_contents (no per-element encoding).
  *
- * Async methods must be called from the game thread; callbacks arrive on the game thread.
- * The *Sync variants pump the HTTP manager until completion and exist for tests and tools only.
+ * Async methods must be called from the game thread; completions are delivered on the game thread
+ * during the engine tick (or by the *Sync variants, which pump until done). Thread-safe internally.
  */
 class MANIPLEINFERENCE_API FManipleTritonClient
 {
 public:
-	explicit FManipleTritonClient(const FString& InBaseUrl = TEXT("http://localhost:8000"), float InTimeoutSec = 5.f);
+	explicit FManipleTritonClient(const FString& InTarget = TEXT("localhost:8001"), float InTimeoutSec = 5.f);
+	~FManipleTritonClient();
 
-	const FString& GetBaseUrl() const { return BaseUrl; }
+	const FString& GetTarget() const { return Target; }
 
-	/** GET /v2/health/ready */
-	void IsServerReady(FManipleReadyComplete OnComplete) const;
-	bool IsServerReadySync(float WaitSec = 5.f) const;
+	/** ServerReady RPC. */
+	void IsServerReady(FManipleReadyComplete OnComplete);
+	bool IsServerReadySync(float WaitSec = 5.f);
 
 	/**
-	 * POST /v2/models/{Model}[/versions/{Version}]/infer with binary inputs; all outputs requested as binary.
-	 * @param OutputNames  optional subset of outputs; empty = all outputs of the model.
+	 * ModelInfer RPC. @param OutputNames optional subset; empty = all outputs of the model.
 	 */
 	void Infer(const FString& Model, TArray<FManipleTensor> Inputs, FManipleInferComplete OnComplete,
-		const TArray<FString>& OutputNames = {}, const FString& Version = FString()) const;
+		const TArray<FString>& OutputNames = {}, const FString& Version = FString());
 	FManipleInferResult InferSync(const FString& Model, TArray<FManipleTensor> Inputs,
-		const TArray<FString>& OutputNames = {}, const FString& Version = FString()) const;
+		const TArray<FString>& OutputNames = {}, const FString& Version = FString());
 
-	/** Build the KServe v2 request body (JSON header + raw tensor bytes). Exposed for tests. */
-	static TArray<uint8> BuildInferBody(const TArray<FManipleTensor>& Inputs, const TArray<FString>& OutputNames, int32& OutJsonLength);
-	/** Parse a KServe v2 response body. JsonLength < 0 means no binary header: the body is plain JSON. */
-	static bool ParseInferResponse(const TArray<uint8>& Body, int32 JsonLength, FManipleInferResult& Out);
+	/** Delivers finished completions to their callbacks. Called automatically each frame; also usable manually. */
+	void PumpCompletions();
+
+	/** Number of requests in flight. */
+	int32 NumPending() const;
 
 private:
-	FString BaseUrl;
+	struct FImpl;
+	TUniquePtr<FImpl> Impl;
+	FString Target;
 	float TimeoutSec;
 };

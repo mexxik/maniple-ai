@@ -1,0 +1,8 @@
+[submodule "third_party/grpc"]
+	path = third_party/grpc
+	url = https://github.com/grpc/grpc
+	branch = v1.71.0
+[submodule "third_party/triton-common"]
+	path = third_party/triton-common
+	url = https://github.com/triton-inference-server/common
+	branch = r26.07

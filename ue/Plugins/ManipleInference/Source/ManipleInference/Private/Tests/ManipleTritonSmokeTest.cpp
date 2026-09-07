@@ -1,5 +1,5 @@
 // Smoke test against a running Triton: readiness, correctness vs the exported reference, round-trip latency.
-// Server URL: -ManipleTritonUrl=http://host:8000 (default http://localhost:8000).
+// Server URL: -ManipleTritonUrl=host:8001 (default localhost:8001).
 #include "Misc/AutomationTest.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
@@ -19,7 +19,7 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(FManipleTritonSmokeTest, "Maniple.Triton.Smoke"
 
 bool FManipleTritonSmokeTest::RunTest(const FString& Parameters)
 {
-	FString Url = TEXT("http://localhost:8000");
+	FString Url = TEXT("localhost:8001");
 	FParse::Value(FCommandLine::Get(), TEXT("ManipleTritonUrl="), Url);
 
 	// reference produced by python/export_policy.py

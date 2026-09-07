@@ -22,3 +22,9 @@ triton/model_repository/*/[0-9]*/
 
 # misc
 .DS_Store
+
+# third-party build output (produced by scripts/build_grpc_*.sh)
+third_party/_build/
+ue/Plugins/ManipleInference/Source/ThirdParty/ManipleGrpc/lib/
+ue/Plugins/ManipleInference/Source/ThirdParty/ManipleGrpc/include/
+ue/Plugins/ManipleInference/Source/ThirdParty/ManipleGrpc/tools/

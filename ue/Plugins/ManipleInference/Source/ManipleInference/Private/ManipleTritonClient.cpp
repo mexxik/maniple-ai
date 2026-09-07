@@ -1,16 +1,14 @@
 #include "ManipleTritonClient.h"
 #include "ManipleInference.h"
-#include "HttpModule.h"
-#include "HttpManager.h"
-#include "Interfaces/IHttpRequest.h"
-#include "Interfaces/IHttpResponse.h"
-#include "Dom/JsonObject.h"
-#include "Serialization/JsonReader.h"
-#include "Serialization/JsonSerializer.h"
-#include "Serialization/JsonWriter.h"
-#include "Policies/CondensedJsonPrintPolicy.h"
+#include "Triton/ManipleGrpcIncludes.h"
+#include "Containers/Queue.h"
+#include "Containers/Ticker.h"
+#include "HAL/Thread.h"
 #include "HAL/PlatformTime.h"
 #include "HAL/PlatformProcess.h"
+#include <atomic>
+#include <chrono>
+#include <memory>
 
 // ---------- types ----------
 
@@ -46,215 +44,206 @@ const FManipleTensor* FManipleInferResult::FindOutput(const FString& Name) const
 	return Outputs.FindByPredicate([&](const FManipleTensor& T) { return T.Name == Name; });
 }
 
-// ---------- client ----------
+// ---------- gRPC plumbing ----------
 
-FManipleTritonClient::FManipleTritonClient(const FString& InBaseUrl, float InTimeoutSec)
-	: BaseUrl(InBaseUrl), TimeoutSec(InTimeoutSec)
+namespace
 {
-	while (BaseUrl.EndsWith(TEXT("/"))) BaseUrl.LeftChopInline(1);
-}
-
-void FManipleTritonClient::IsServerReady(FManipleReadyComplete OnComplete) const
-{
-	TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Req = FHttpModule::Get().CreateRequest();
-	Req->SetURL(BaseUrl + TEXT("/v2/health/ready"));
-	Req->SetVerb(TEXT("GET"));
-	Req->SetTimeout(TimeoutSec);
-	Req->OnProcessRequestComplete().BindLambda([OnComplete](FHttpRequestPtr, FHttpResponsePtr Resp, bool bOk)
+	/** One in-flight RPC. Owned by the completion queue until it finishes, then by the game thread until delivered. */
+	struct FCallBase
 	{
-		OnComplete.ExecuteIfBound(bOk && Resp.IsValid() && Resp->GetResponseCode() == 200);
-	});
-	Req->ProcessRequest();
+		grpc::ClientContext Ctx;
+		grpc::Status Status;
+		double StartSec = 0.0;
+		virtual ~FCallBase() = default;
+		virtual void Deliver() = 0;   // game thread
+	};
+
+	struct FInferCall final : FCallBase
+	{
+		inference::ModelInferResponse Response;
+		std::unique_ptr<grpc::ClientAsyncResponseReader<inference::ModelInferResponse>> Reader;
+		FManipleInferComplete OnComplete;
+		FString Model;
+
+		virtual void Deliver() override
+		{
+			FManipleInferResult R;
+			R.LatencyMs = (FPlatformTime::Seconds() - StartSec) * 1000.0;
+			R.StatusCode = (int32)Status.error_code();
+			if (!Status.ok())
+			{
+				R.Error = FString::Printf(TEXT("grpc %d: %s"), R.StatusCode, UTF8_TO_TCHAR(Status.error_message().c_str()));
+				UE_LOG(LogManipleInference, Warning, TEXT("infer %s failed: %s"), *Model, *R.Error);
+				OnComplete.ExecuteIfBound(R);
+				return;
+			}
+			R.ModelName = UTF8_TO_TCHAR(Response.model_name().c_str());
+			R.ModelVersion = UTF8_TO_TCHAR(Response.model_version().c_str());
+			const int32 N = Response.outputs_size();
+			R.Outputs.Reserve(N);
+			for (int32 i = 0; i < N; ++i)
+			{
+				const inference::ModelInferResponse::InferOutputTensor& O = Response.outputs(i);
+				FManipleTensor T;
+				T.Name = UTF8_TO_TCHAR(O.name().c_str());
+				T.Datatype = UTF8_TO_TCHAR(O.datatype().c_str());
+				T.Shape.Reserve(O.shape_size());
+				for (int32 d = 0; d < O.shape_size(); ++d) T.Shape.Add(O.shape(d));
+				if (i < Response.raw_output_contents_size())
+				{
+					const std::string& Raw = Response.raw_output_contents(i);
+					T.Data.Append(reinterpret_cast<const uint8*>(Raw.data()), (int32)Raw.size());
+				}
+				else if (O.has_contents() && O.contents().fp32_contents_size() > 0)
+				{
+					T.Data.Append(reinterpret_cast<const uint8*>(O.contents().fp32_contents().data()), O.contents().fp32_contents_size() * sizeof(float));
+				}
+				R.Outputs.Add(MoveTemp(T));
+			}
+			R.bSuccess = true;
+			OnComplete.ExecuteIfBound(R);
+		}
+	};
+
+	struct FReadyCall final : FCallBase
+	{
+		inference::ServerReadyResponse Response;
+		std::unique_ptr<grpc::ClientAsyncResponseReader<inference::ServerReadyResponse>> Reader;
+		FManipleReadyComplete OnComplete;
+		virtual void Deliver() override { OnComplete.ExecuteIfBound(Status.ok() && Response.ready()); }
+	};
 }
 
-bool FManipleTritonClient::IsServerReadySync(float WaitSec) const
+struct FManipleTritonClient::FImpl
+{
+	std::shared_ptr<grpc::Channel> Channel;
+	std::unique_ptr<inference::GRPCInferenceService::Stub> Stub;
+	grpc::CompletionQueue CQ;
+	TUniquePtr<FThread> Thread;
+	TQueue<FCallBase*, EQueueMode::Spsc> Finished;   // CQ thread -> game thread
+	std::atomic<int32> Pending{ 0 };
+	FTSTicker::FDelegateHandle Ticker;
+
+	void Start(const FString& Target)
+	{
+		grpc::ChannelArguments Args;
+		Args.SetMaxReceiveMessageSize(64 << 20);
+		Args.SetMaxSendMessageSize(64 << 20);
+		Channel = grpc::CreateCustomChannel(TCHAR_TO_UTF8(*Target), grpc::InsecureChannelCredentials(), Args);
+		Stub = inference::GRPCInferenceService::NewStub(Channel);
+		Thread = MakeUnique<FThread>(TEXT("ManipleGrpcCQ"), [this]()
+		{
+			void* Tag = nullptr; bool bOk = false;
+			while (CQ.Next(&Tag, &bOk))
+			{
+				Finished.Enqueue(static_cast<FCallBase*>(Tag));
+			}
+		});
+	}
+
+	void Stop()
+	{
+		CQ.Shutdown();
+		if (Thread.IsValid()) { Thread->Join(); Thread.Reset(); }
+		FCallBase* Call = nullptr;
+		while (Finished.Dequeue(Call)) delete Call;
+	}
+
+	void Pump()
+	{
+		FCallBase* Call = nullptr;
+		while (Finished.Dequeue(Call))
+		{
+			--Pending;
+			Call->Deliver();
+			delete Call;
+		}
+	}
+};
+
+FManipleTritonClient::FManipleTritonClient(const FString& InTarget, float InTimeoutSec)
+	: Impl(MakeUnique<FImpl>()), Target(InTarget), TimeoutSec(InTimeoutSec)
+{
+	// accept http://host:port too
+	Target.RemoveFromStart(TEXT("http://"));
+	Target.RemoveFromStart(TEXT("grpc://"));
+	while (Target.EndsWith(TEXT("/"))) Target.LeftChopInline(1);
+	Impl->Start(Target);
+	Impl->Ticker = FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([this](float) { PumpCompletions(); return true; }));
+}
+
+FManipleTritonClient::~FManipleTritonClient()
+{
+	FTSTicker::GetCoreTicker().RemoveTicker(Impl->Ticker);
+	Impl->Stop();
+}
+
+void FManipleTritonClient::PumpCompletions()
+{
+	Impl->Pump();
+}
+
+int32 FManipleTritonClient::NumPending() const
+{
+	return Impl->Pending.load();
+}
+
+void FManipleTritonClient::IsServerReady(FManipleReadyComplete OnComplete)
+{
+	FReadyCall* Call = new FReadyCall();
+	Call->OnComplete = MoveTemp(OnComplete);
+	Call->StartSec = FPlatformTime::Seconds();
+	Call->Ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds((int64)(TimeoutSec * 1000)));
+	++Impl->Pending;
+	inference::ServerReadyRequest Req;
+	Call->Reader = Impl->Stub->AsyncServerReady(&Call->Ctx, Req, &Impl->CQ);
+	Call->Reader->Finish(&Call->Response, &Call->Status, Call);
+}
+
+bool FManipleTritonClient::IsServerReadySync(float WaitSec)
 {
 	TSharedRef<bool> Done = MakeShared<bool>(false);
 	TSharedRef<bool> Ready = MakeShared<bool>(false);
 	IsServerReady(FManipleReadyComplete::CreateLambda([Done, Ready](bool bReady) { *Ready = bReady; *Done = true; }));
 	const double Deadline = FPlatformTime::Seconds() + WaitSec;
-	while (!*Done && FPlatformTime::Seconds() < Deadline)
-	{
-		FHttpModule::Get().GetHttpManager().Tick(0.01f);
-		FPlatformProcess::Sleep(0.005f);
-	}
+	while (!*Done && FPlatformTime::Seconds() < Deadline) { PumpCompletions(); FPlatformProcess::Sleep(0.0005f); }
 	return *Done && *Ready;
 }
 
-TArray<uint8> FManipleTritonClient::BuildInferBody(const TArray<FManipleTensor>& Inputs, const TArray<FString>& OutputNames, int32& OutJsonLength)
+void FManipleTritonClient::Infer(const FString& Model, TArray<FManipleTensor> Inputs, FManipleInferComplete OnComplete,
+	const TArray<FString>& OutputNames, const FString& Version)
 {
-	TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
-	TArray<TSharedPtr<FJsonValue>> InputsJson;
-	int64 BinaryBytes = 0;
+	inference::ModelInferRequest Req;
+	Req.set_model_name(TCHAR_TO_UTF8(*Model));
+	if (!Version.IsEmpty()) Req.set_model_version(TCHAR_TO_UTF8(*Version));
 	for (const FManipleTensor& T : Inputs)
 	{
-		TSharedRef<FJsonObject> In = MakeShared<FJsonObject>();
-		In->SetStringField(TEXT("name"), T.Name);
-		In->SetStringField(TEXT("datatype"), T.Datatype);
-		TArray<TSharedPtr<FJsonValue>> Shape;
-		for (int64 D : T.Shape) Shape.Add(MakeShared<FJsonValueNumber>((double)D));
-		In->SetArrayField(TEXT("shape"), Shape);
-		TSharedRef<FJsonObject> Params = MakeShared<FJsonObject>();
-		Params->SetNumberField(TEXT("binary_data_size"), (double)T.Data.Num());
-		In->SetObjectField(TEXT("parameters"), Params);
-		InputsJson.Add(MakeShared<FJsonValueObject>(In));
-		BinaryBytes += T.Data.Num();
+		inference::ModelInferRequest::InferInputTensor* In = Req.add_inputs();
+		In->set_name(TCHAR_TO_UTF8(*T.Name));
+		In->set_datatype(TCHAR_TO_UTF8(*T.Datatype));
+		for (int64 D : T.Shape) In->add_shape(D);
+		Req.add_raw_input_contents(T.Data.GetData(), T.Data.Num());
 	}
-	Root->SetArrayField(TEXT("inputs"), InputsJson);
-	if (OutputNames.Num() > 0)
-	{
-		TArray<TSharedPtr<FJsonValue>> OutsJson;
-		for (const FString& N : OutputNames)
-		{
-			TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-			Out->SetStringField(TEXT("name"), N);
-			TSharedRef<FJsonObject> Params = MakeShared<FJsonObject>();
-			Params->SetBoolField(TEXT("binary_data"), true);
-			Out->SetObjectField(TEXT("parameters"), Params);
-			OutsJson.Add(MakeShared<FJsonValueObject>(Out));
-		}
-		Root->SetArrayField(TEXT("outputs"), OutsJson);
-	}
-	else
-	{
-		TSharedRef<FJsonObject> Params = MakeShared<FJsonObject>();
-		Params->SetBoolField(TEXT("binary_data_output"), true);
-		Root->SetObjectField(TEXT("parameters"), Params);
-	}
+	for (const FString& N : OutputNames) Req.add_outputs()->set_name(TCHAR_TO_UTF8(*N));
 
-	FString Json;
-	TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer = TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&Json);
-	FJsonSerializer::Serialize(Root, Writer);
-
-	FTCHARToUTF8 Utf8(*Json);
-	OutJsonLength = Utf8.Length();
-	TArray<uint8> Body;
-	Body.Reserve(OutJsonLength + BinaryBytes);
-	Body.Append(reinterpret_cast<const uint8*>(Utf8.Get()), OutJsonLength);
-	for (const FManipleTensor& T : Inputs) Body.Append(T.Data);
-	return Body;
-}
-
-bool FManipleTritonClient::ParseInferResponse(const TArray<uint8>& Body, int32 JsonLength, FManipleInferResult& Out)
-{
-	const int32 JsonBytes = JsonLength < 0 ? Body.Num() : FMath::Min(JsonLength, Body.Num());
-	const FString Json = FString(FUTF8ToTCHAR(reinterpret_cast<const ANSICHAR*>(Body.GetData()), JsonBytes));
-	TSharedPtr<FJsonObject> Root;
-	if (!FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(Json), Root) || !Root.IsValid())
-	{
-		Out.Error = TEXT("response is not valid JSON");
-		return false;
-	}
-	if (Root->HasField(TEXT("error")))
-	{
-		Out.Error = Root->GetStringField(TEXT("error"));
-		return false;
-	}
-	Root->TryGetStringField(TEXT("model_name"), Out.ModelName);
-	Root->TryGetStringField(TEXT("model_version"), Out.ModelVersion);
-
-	const TArray<TSharedPtr<FJsonValue>>* OutputsJson = nullptr;
-	if (!Root->TryGetArrayField(TEXT("outputs"), OutputsJson))
-	{
-		Out.Error = TEXT("response has no outputs");
-		return false;
-	}
-	int32 Cursor = JsonBytes;
-	for (const TSharedPtr<FJsonValue>& V : *OutputsJson)
-	{
-		const TSharedPtr<FJsonObject>& O = V->AsObject();
-		FManipleTensor T;
-		T.Name = O->GetStringField(TEXT("name"));
-		T.Datatype = O->GetStringField(TEXT("datatype"));
-		for (const TSharedPtr<FJsonValue>& D : O->GetArrayField(TEXT("shape"))) T.Shape.Add((int64)D->AsNumber());
-
-		const TSharedPtr<FJsonObject>* Params = nullptr;
-		double BinSize = -1;
-		if (O->TryGetObjectField(TEXT("parameters"), Params)) (*Params)->TryGetNumberField(TEXT("binary_data_size"), BinSize);
-		if (BinSize >= 0)
-		{
-			const int32 N = (int32)BinSize;
-			if (Cursor + N > Body.Num())
-			{
-				Out.Error = FString::Printf(TEXT("binary payload for '%s' truncated"), *T.Name);
-				return false;
-			}
-			T.Data.Append(Body.GetData() + Cursor, N);
-			Cursor += N;
-		}
-		else
-		{
-			// JSON number array fallback (server ignored binary request)
-			const int32 ES = FManipleTensor::ElementSize(T.Datatype);
-			if (ES == 0 || T.Datatype != TEXT("FP32"))
-			{
-				Out.Error = FString::Printf(TEXT("non-binary output '%s' of type %s unsupported"), *T.Name, *T.Datatype);
-				return false;
-			}
-			for (const TSharedPtr<FJsonValue>& D : O->GetArrayField(TEXT("data")))
-			{
-				const float F = (float)D->AsNumber();
-				T.Data.Append(reinterpret_cast<const uint8*>(&F), sizeof(float));
-			}
-		}
-		Out.Outputs.Add(MoveTemp(T));
-	}
-	return true;
-}
-
-void FManipleTritonClient::Infer(const FString& Model, TArray<FManipleTensor> Inputs, FManipleInferComplete OnComplete,
-	const TArray<FString>& OutputNames, const FString& Version) const
-{
-	int32 JsonLen = 0;
-	TArray<uint8> Body = BuildInferBody(Inputs, OutputNames, JsonLen);
-
-	FString Url = BaseUrl + TEXT("/v2/models/") + Model;
-	if (!Version.IsEmpty()) Url += TEXT("/versions/") + Version;
-	Url += TEXT("/infer");
-
-	TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Req = FHttpModule::Get().CreateRequest();
-	Req->SetURL(Url);
-	Req->SetVerb(TEXT("POST"));
-	Req->SetTimeout(TimeoutSec);
-	Req->SetHeader(TEXT("Content-Type"), TEXT("application/octet-stream"));
-	Req->SetHeader(TEXT("Inference-Header-Content-Length"), FString::FromInt(JsonLen));
-	Req->SetContent(MoveTemp(Body));
-
-	const double T0 = FPlatformTime::Seconds();
-	Req->OnProcessRequestComplete().BindLambda([OnComplete, T0, Model](FHttpRequestPtr, FHttpResponsePtr Resp, bool bOk)
-	{
-		FManipleInferResult R;
-		R.LatencyMs = (FPlatformTime::Seconds() - T0) * 1000.0;
-		if (!bOk || !Resp.IsValid())
-		{
-			R.Error = TEXT("request failed (connection/timeout)");
-			OnComplete.ExecuteIfBound(R);
-			return;
-		}
-		R.HttpStatus = Resp->GetResponseCode();
-		const FString HeaderLen = Resp->GetHeader(TEXT("Inference-Header-Content-Length"));
-		const int32 JsonLength = HeaderLen.IsEmpty() ? -1 : FCString::Atoi(*HeaderLen);
-		const bool bParsed = FManipleTritonClient::ParseInferResponse(Resp->GetContent(), JsonLength, R);
-		R.bSuccess = bParsed && R.HttpStatus == 200;
-		if (!R.bSuccess && R.Error.IsEmpty()) R.Error = FString::Printf(TEXT("HTTP %d"), R.HttpStatus);
-		if (!R.bSuccess) UE_LOG(LogManipleInference, Warning, TEXT("infer %s failed: %s"), *Model, *R.Error);
-		OnComplete.ExecuteIfBound(R);
-	});
-	Req->ProcessRequest();
+	FInferCall* Call = new FInferCall();
+	Call->OnComplete = MoveTemp(OnComplete);
+	Call->Model = Model;
+	Call->StartSec = FPlatformTime::Seconds();
+	Call->Ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds((int64)(TimeoutSec * 1000)));
+	++Impl->Pending;
+	Call->Reader = Impl->Stub->AsyncModelInfer(&Call->Ctx, Req, &Impl->CQ);
+	Call->Reader->Finish(&Call->Response, &Call->Status, Call);
 }
 
 FManipleInferResult FManipleTritonClient::InferSync(const FString& Model, TArray<FManipleTensor> Inputs,
-	const TArray<FString>& OutputNames, const FString& Version) const
+	const TArray<FString>& OutputNames, const FString& Version)
 {
 	TSharedRef<FManipleInferResult> Result = MakeShared<FManipleInferResult>();
 	TSharedRef<bool> Done = MakeShared<bool>(false);
 	Infer(Model, MoveTemp(Inputs), FManipleInferComplete::CreateLambda([Result, Done](const FManipleInferResult& R) { *Result = R; *Done = true; }), OutputNames, Version);
 	const double Deadline = FPlatformTime::Seconds() + TimeoutSec + 1.0;
-	while (!*Done && FPlatformTime::Seconds() < Deadline)
-	{
-		FHttpModule::Get().GetHttpManager().Tick(0.01f);
-		FPlatformProcess::Sleep(0.001f);
-	}
+	while (!*Done && FPlatformTime::Seconds() < Deadline) { PumpCompletions(); FPlatformProcess::Sleep(0.0002f); }
 	if (!*Done) Result->Error = TEXT("InferSync timed out");
 	return *Result;
 }
