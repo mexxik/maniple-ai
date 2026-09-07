@@ -5,6 +5,8 @@
     .venv/bin/python play.py --env CartPole-v1 --name cartpole --episodes 20 --render none        # scores only
 
 Add --explore to sample actions like during training instead of acting greedily.
+--channel best|latest|stable|<n> picks the version (default best); --report feeds the score back to the trainer;
+--promote pins 'stable' to the version you just watched.
 """
 
 import argparse
@@ -34,10 +36,17 @@ def parse_args():
     parser.add_argument("--fps", type=int, default=50, help="playback / video frame rate")
     parser.add_argument("--explore", action="store_true", help="sample actions instead of greedy")
     parser.add_argument("--max-steps", type=int, default=1000, help="safety cap per episode")
+    parser.add_argument("--channel", default="best", help="best | latest | stable | <version number>")
+    parser.add_argument(
+        "--report", action="store_true", help="send the mean return to the trainer as an eval score"
+    )
+    parser.add_argument(
+        "--promote", action="store_true", help="after playing, pin 'stable' to the version played"
+    )
     return parser.parse_args()
 
 
-def play_episode(env, agent, explore, max_steps, render, frames, fps):
+def play_episode(env, agent, explore, max_steps, render, frames, fps, channel):
     """Run one episode. Returns (return, steps, served policy version)."""
     discrete = isinstance(env.action_space, gym.spaces.Discrete)
     obs, _ = env.reset()
@@ -45,7 +54,7 @@ def play_episode(env, agent, explore, max_steps, render, frames, fps):
     version = 0
 
     for step in range(1, max_steps + 1):
-        action, action_index, _, version = agent.act(obs[None], explore=explore)
+        action, action_index, _, version = agent.act(obs[None], explore=explore, channel=channel)
 
         if discrete:
             env_action = int(action_index[0])
@@ -78,14 +87,24 @@ def main():
 
     for episode in range(1, args.episodes + 1):
         episode_return, steps, version = play_episode(
-            env, agent, args.explore, args.max_steps, render, frames, args.fps
+            env, agent, args.explore, args.max_steps, render, frames, args.fps, args.channel
         )
         returns.append(episode_return)
         print(f"episode {episode}: return {episode_return:8.1f}  steps {steps:4d}  policy v{version}")
 
     mode = "explore" if args.explore else "greedy"
-    print(f"mean return {np.mean(returns):.1f} over {len(returns)} episodes ({mode})")
+    mean_return = float(np.mean(returns))
+    print(
+        f"mean return {mean_return:.1f} over {len(returns)} episodes ({mode}, channel {args.channel} -> v{version})"
+    )
     env.close()
+
+    if args.report and not args.explore:
+        status = agent.report(version, mean_return, len(returns))
+        print(f"reported: best is now v{status['versions']['best']}")
+    if args.promote:
+        status = agent.promote(version)
+        print(f"promoted: stable is now v{status['versions']['stable']}")
 
     if args.video:
         import imageio

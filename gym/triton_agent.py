@@ -56,6 +56,19 @@ class TritonAgent:
     def status(self):
         return self._train_call("status")
 
+    def report(self, version, score, episodes=1):
+        """Tell the trainer how a version scored in greedy evaluation (drives the 'best' channel)."""
+        return self._train_call(
+            "report",
+            version=np.array([version], dtype=np.int64),
+            score=np.array([score], dtype=np.float32),
+            episodes=np.array([episodes], dtype=np.int64),
+        )
+
+    def promote(self, version):
+        """Pin the 'stable' channel to a version."""
+        return self._train_call("promote", version=np.array([version], dtype=np.int64))
+
     def stored_spec(self):
         """The spec an existing policy was created with, or None if the name is unknown."""
         try:
@@ -88,8 +101,10 @@ class TritonAgent:
 
     # ------------------------------------------------------------------ inference side
 
-    def act(self, obs, explore=True):
+    def act(self, obs, explore=True, channel="best"):
         """obs [N, obs_dim] -> (action [N, act_dim], action_index [N], logp [N], served policy version).
+
+        channel: best (default) | latest | stable | "<version>". Training actors must use latest.
 
         action is the continuous action, or a one-hot of the chosen discrete action.
         action_index is the discrete index (-1 for continuous).
@@ -100,6 +115,7 @@ class TritonAgent:
             make_input("name", make_string(self.name)),
             make_input("obs", obs.astype(np.float32)),
             make_input("explore", np.array([explore])),
+            make_input("channel", make_string(str(channel))),
         ]
         wanted = ("action", "action_index", "logp", "policy_version", "status")
         response = self.client.infer(

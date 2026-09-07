@@ -3,7 +3,8 @@
     from maniple.infer_model import InferModel
     class TritonPythonModel(InferModel): pass
 
-Inputs : name (STRING [1]), obs (FP32 [N, obs_dim]), explore (BOOL [1], optional, default false)
+Inputs : name (STRING [1]), obs (FP32 [N, obs_dim]), explore (BOOL [1], optional, default false),
+         channel (STRING [1], optional): best (default) | latest | stable | "<version>" — see versions.py
 Outputs: action         FP32 [N, act_dim]  continuous action, or one-hot of the chosen discrete action
          action_index   INT64 [N]          chosen index for discrete, -1 for continuous
          logp           FP32 [N]           log-prob of the returned action under the served policy;
@@ -19,11 +20,13 @@ server-side so the game client stays generic. If the policy model is not ready y
 from __future__ import annotations
 
 import json
+import os
 
 import numpy as np
 import triton_python_backend_utils as pb_utils
 
 from .export import policy_model_name
+from .versions import read_manifest
 
 
 def _string_input(request, name):
@@ -50,9 +53,46 @@ def _to_numpy(tensor):
     return torch.from_dlpack(tensor.to_dlpack()).cpu().numpy()
 
 
+class _ManifestCache:
+    """versions.json per policy, re-read when its mtime changes."""
+
+    def __init__(self, model_repository: str):
+        self.model_repository = model_repository
+        self._cache: dict[str, tuple[float, dict | None]] = {}
+
+    def resolve(self, model: str, channel: str) -> int:
+        """Concrete version for a channel; -1 = let Triton pick (newest loaded)."""
+        if channel.isdigit():
+            return int(channel)
+        manifest = self._get(model)
+        if manifest is None:
+            return -1
+        version = manifest.get(channel)
+        if channel == "best" and version is None:
+            version = manifest.get("latest")
+        if channel == "stable" and version is None:
+            version = manifest.get("best") or manifest.get("latest")
+        return int(version) if version else -1
+
+    def _get(self, model: str) -> dict | None:
+        model_dir = os.path.join(self.model_repository, model)
+        path = os.path.join(model_dir, "versions.json")
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            return None
+        cached = self._cache.get(model)
+        if cached is None or cached[0] != mtime:
+            self._cache[model] = (mtime, read_manifest(model_dir))
+        return self._cache[model][1]
+
+
 class InferModel:
     def initialize(self, args):
         self.rng = np.random.default_rng()
+        cfg = json.loads(args["model_config"])
+        params = {k: v["string_value"] for k, v in cfg.get("parameters", {}).items()}
+        self.manifests = _ManifestCache(params.get("model_repository", "/models"))
 
     def execute(self, requests):
         return [self._handle(request) for request in requests]
@@ -62,33 +102,46 @@ class InferModel:
     def _handle(self, request):
         name = _string_input(request, "name")
         explore = _bool_input(request, "explore", default=False)
+        channel = _string_input(request, "channel") or "best"
         obs = pb_utils.get_input_tensor_by_name(request, "obs").as_numpy().astype(np.float32)
         n = obs.shape[0]
         model = policy_model_name(name)
+        version = self.manifests.resolve(model, channel)
 
-        outputs = self._call_policy(model, obs)
+        outputs = self._call_policy(model, obs, version)
+        if outputs is None and version > 0:
+            # a just-exported (or just-pruned) version may not be loaded yet: fall back to the newest loaded one
+            outputs = self._call_policy(model, obs, -1)
         if outputs is None:
             return self._respond(
                 action=np.zeros((n, 1), np.float32),
                 index=np.full(n, -1, np.int64),
                 logp=np.zeros(n, np.float32),
                 version=0,
-                status={"ok": False, "policy": model, "error": f"{model} is not ready"},
+                status={
+                    "ok": False,
+                    "policy": model,
+                    "error": f"{model} version {version if version > 0 else 'latest'} is not ready",
+                },
             )
 
-        version = int(outputs["policy_version"].reshape(-1)[0]) if "policy_version" in outputs else 0
+        version = (
+            int(outputs["policy_version"].reshape(-1)[0]) if "policy_version" in outputs else 0
+        )  # from the model itself
 
         if "log_std" in outputs:
             action, index, logp = self._continuous(outputs["action"], outputs["log_std"], explore)
         else:
             action, index, logp = self._discrete(outputs["action"], explore)
 
-        return self._respond(action, index, logp, version, {"ok": True, "policy": model, "explore": explore})
+        status = {"ok": True, "policy": model, "explore": explore, "channel": channel}
+        return self._respond(action, index, logp, version, status)
 
-    def _call_policy(self, model, obs):
+    def _call_policy(self, model, obs, version=-1):
         """Run the exported policy model through BLS. Returns {output name: numpy} or None on error."""
         infer = pb_utils.InferenceRequest(
             model_name=model,
+            model_version=version,
             requested_output_names=[],
             inputs=[pb_utils.Tensor("obs", obs)],
             preferred_memory=pb_utils.PreferredMemory(pb_utils.TRITONSERVER_MEMORY_CPU),

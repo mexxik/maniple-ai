@@ -16,8 +16,9 @@ import torch
 
 from .algorithms.base import Algorithm
 from .buffer import TransitionBuffer
-from .export import export_actor, latest_exported_version
+from .export import export_actor, latest_exported_version, policy_model_name
 from .spec import AgentSpec
+from .versions import VersionTracker
 
 
 class Policy:
@@ -25,6 +26,11 @@ class Policy:
         self.name, self.spec, self.reg = name, spec, registry
         self.algo: Algorithm = registry.algorithm_cls(spec, registry.device)
         self.buffer = TransitionBuffer(spec.obs_dim, spec.action.out_dim)
+        self.versions = VersionTracker(
+            model_dir=os.path.join(registry.model_repository, policy_model_name(name)),
+            min_episodes=spec.versioning.min_episodes,
+            keep_latest=spec.versioning.keep_latest,
+        )
         # exported version == Triton model version of '<name>_policy'; continue after whatever is already there
         self.version = latest_exported_version(name, registry.model_repository)
         self.updates = 0
@@ -58,6 +64,8 @@ class Policy:
             max_lag=self.spec.ppo.max_policy_lag,
         )
         self.total_samples += n
+        if agent_id is not None and episode_id is not None and policy_version is not None:
+            self.versions.observe_rows(agent_id, episode_id, reward, done, policy_version)
         return n
 
     def _loop(self):
@@ -65,6 +73,7 @@ class Policy:
             if len(self.buffer) >= self.algo.rollout_size:
                 self.last_stats = self.algo.update(self.buffer.take())
                 self.updates += 1
+                self.versions.refresh()
                 if self.updates % self.reg.export_every_updates == 0:
                     self.export()
                 self.checkpoint()
@@ -74,9 +83,24 @@ class Policy:
     def export(self) -> int:
         self.version += 1
         with self.reg.export_lock:
-            export_actor(self.algo.actor(), self.spec, self.name, self.version, self.reg.model_repository)
+            on_disk = (
+                [int(v) for v in os.listdir(self.versions.model_dir) if v.isdigit()]
+                if os.path.isdir(self.versions.model_dir)
+                else []
+            )
+            keep = self.versions.versions_to_keep(on_disk + [self.version])
+            export_actor(
+                self.algo.actor(), self.spec, self.name, self.version, self.reg.model_repository, keep=keep
+            )
         self.algo.actor().to(self.reg.device)
+        self.versions.on_export(self.version)
         return self.version
+
+    def report(self, version: int, score: float, episodes: int) -> None:
+        self.versions.report(version, score, episodes)
+
+    def promote(self, version: int) -> None:
+        self.versions.promote(version)
 
     def checkpoint(self):
         d = os.path.join(self.reg.checkpoint_dir, self.name)
@@ -109,6 +133,7 @@ class Policy:
             "dropped_stale": self.buffer.dropped_stale,
             "net": self.spec.describe(),
             "spec": json.loads(self.spec.to_json()),
+            "versions": self.versions.summary(),
             "stats": self.last_stats,
         }
 

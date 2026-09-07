@@ -6,7 +6,7 @@ max_batch_size: 0            # rows are the batch dim inside each tensor; shapes
 
 input [
   { name: "name",           data_type: TYPE_STRING, dims: [ 1 ] },
-  { name: "command",        data_type: TYPE_STRING, dims: [ 1 ],  optional: true },   # register | observe | status | export
+  { name: "command",        data_type: TYPE_STRING, dims: [ 1 ],  optional: true },   # register | observe | status | export | report | promote
   { name: "spec",           data_type: TYPE_STRING, dims: [ 1 ],  optional: true },   # JSON AgentSpec (register)
   { name: "agent_id",       data_type: TYPE_INT64,  dims: [ -1 ], optional: true },
   { name: "episode_id",     data_type: TYPE_INT64,  dims: [ -1 ], optional: true },
@@ -15,7 +15,10 @@ input [
   { name: "reward",         data_type: TYPE_FP32,   dims: [ -1 ], optional: true },
   { name: "done",           data_type: TYPE_BOOL,   dims: [ -1 ], optional: true },
   { name: "policy_version", data_type: TYPE_INT64,  dims: [ -1 ], optional: true },
-  { name: "logp",           data_type: TYPE_FP32,   dims: [ -1 ], optional: true }   # behaviour log-prob from <algo>_infer
+  { name: "logp",           data_type: TYPE_FP32,   dims: [ -1 ], optional: true },  # behaviour log-prob from <algo>_infer
+  { name: "version",        data_type: TYPE_INT64,  dims: [ 1 ],  optional: true },  # report / promote
+  { name: "score",          data_type: TYPE_FP32,   dims: [ 1 ],  optional: true },  # report
+  { name: "episodes",       data_type: TYPE_INT64,  dims: [ 1 ],  optional: true }   # report
 ]
 output [
   { name: "status", data_type: TYPE_STRING, dims: [ 1 ] }      # JSON: {ok, name, version, samples, updates, ...}

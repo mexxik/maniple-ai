@@ -128,7 +128,9 @@ def main():
     for step in range(1, args.steps + 1):
         obs_batch = obs.reshape(args.agents, -1).astype(np.float32)
 
-        action, action_index, logp, served_version = agent.act(obs_batch, explore=not args.no_explore)
+        action, action_index, logp, served_version = agent.act(
+            obs_batch, explore=not args.no_explore, channel="latest"
+        )
         next_obs, reward, terminated, truncated, _ = envs.step(
             to_env_action(action, action_index, spec["action"])
         )

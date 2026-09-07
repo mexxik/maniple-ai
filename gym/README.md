@@ -55,6 +55,23 @@ every `status`.
     # stochastic actions (as during training), slower playback
     DISPLAY=:0 .venv/bin/python play.py --env Pendulum-v1 --name pendulum --explore --fps 30
 
+## Versions and channels
+
+Every PPO update exports a new version of `<name>_policy`. Clients never pick numbers, they pick a channel:
+
+| channel | meaning |
+|---|---|
+| `latest` | newest export; what `run.py` uses while training |
+| `best` | highest-scoring version with at least `min_episodes` training episodes, or a reported eval score; default for `play.py` |
+| `stable` | manually promoted; never moves on its own |
+
+    .venv/bin/python play.py --name cartpole --episodes 20 --render none --report     # greedy eval, score fed back -> 'best'
+    .venv/bin/python play.py --name cartpole --channel latest --episodes 3            # watch the newest one
+    .venv/bin/python play.py --name cartpole --channel 97 --episodes 3 --promote      # pin 'stable' to v97
+    cat ../triton/model_repository/cartpole_policy/versions.json                       # the manifest: channels + scores
+
+Retention: the last `keep_latest` versions plus `best` and `stable` stay on disk; everything else is pruned.
+
 ## Inspect the server
 
     curl -s -X POST localhost:8000/v2/repository/index                         # models and versions

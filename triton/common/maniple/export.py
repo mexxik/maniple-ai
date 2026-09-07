@@ -12,8 +12,6 @@ import torch
 from .nets import Actor
 from .spec import AgentSpec
 
-KEEP_VERSIONS = 3  # older exported version dirs are deleted (Triton has already unloaded them)
-
 
 class _Exported(torch.nn.Module):
     """Actor + constant 'policy_version' output, so whoever serves the model can report which version it is."""
@@ -36,7 +34,7 @@ input  [ {{ name: "obs",    data_type: TYPE_FP32, dims: [ {obs} ] }} ]
 output [ {outputs} ]
 dynamic_batching {{ preferred_batch_size: [ 64, 256, 1024 ] max_queue_delay_microseconds: 500 }}
 instance_group [ {{ count: 1, kind: KIND_GPU }} ]
-version_policy: {{ latest: {{ num_versions: 1 }} }}
+version_policy: {{ all: {{ }} }}
 """
 
 
@@ -69,20 +67,36 @@ def latest_exported_version(name: str, model_repository: str) -> int:
     return max((int(v) for v in os.listdir(d) if v.isdigit()), default=0)
 
 
-def export_actor(actor: Actor, spec: AgentSpec, name: str, version: int, model_repository: str) -> str:
+def _write_config(model_dir: str, name: str, spec: AgentSpec) -> None:
+    """Write config.pbtxt if missing or different (Triton reloads the model on a config change)."""
+    outputs = f'{{ name: "action", data_type: TYPE_FP32, dims: [ {spec.action.out_dim} ] }}'
+    if spec.action.type == "continuous":
+        outputs += f', {{ name: "log_std", data_type: TYPE_FP32, dims: [ {spec.action.out_dim} ] }}'
+    outputs += ', { name: "policy_version", data_type: TYPE_INT64, dims: [ 1 ], reshape: { shape: [ ] } }'
+    content = CONFIG.format(model=policy_model_name(name), obs=spec.obs_dim, outputs=outputs)
+
+    cfg_path = os.path.join(model_dir, "config.pbtxt")
+    if os.path.exists(cfg_path):
+        with open(cfg_path) as f:
+            if f.read() == content:
+                return
+    with open(cfg_path, "w") as f:
+        f.write(content)
+
+
+def export_actor(
+    actor: Actor,
+    spec: AgentSpec,
+    name: str,
+    version: int,
+    model_repository: str,
+    keep: set[int] | None = None,
+) -> str:
+    """Write '<name>_policy/<version>/model.onnx'. `keep` = versions that must survive pruning (None = keep all)."""
     model_dir = os.path.join(model_repository, policy_model_name(name))
     version_dir = os.path.join(model_dir, str(version))
     os.makedirs(model_dir, exist_ok=True)
-    cfg_path = os.path.join(model_dir, "config.pbtxt")
-    if not os.path.exists(cfg_path):
-        with open(cfg_path, "w") as f:
-            outputs = f'{{ name: "action", data_type: TYPE_FP32, dims: [ {spec.action.out_dim} ] }}'
-            if spec.action.type == "continuous":
-                outputs += f', {{ name: "log_std", data_type: TYPE_FP32, dims: [ {spec.action.out_dim} ] }}'
-            outputs += (
-                ', { name: "policy_version", data_type: TYPE_INT64, dims: [ 1 ], reshape: { shape: [ ] } }'
-            )
-            f.write(CONFIG.format(model=policy_model_name(name), obs=spec.obs_dim, outputs=outputs))
+    _write_config(model_dir, name, spec)
 
     # write to a temp dir and rename: Triton must never see a half-written version directory
     tmp = tempfile.mkdtemp(prefix=f".{version}-", dir=model_dir)
@@ -106,6 +120,12 @@ def export_actor(actor: Actor, spec: AgentSpec, name: str, version: int, model_r
 
     os.chmod(tmp, 0o755)
     os.replace(tmp, version_dir)
-    for old in sorted((int(v) for v in os.listdir(model_dir) if v.isdigit()), reverse=True)[KEEP_VERSIONS:]:
-        shutil.rmtree(os.path.join(model_dir, str(old)), ignore_errors=True)
+    if keep is not None:
+        prune_versions(model_dir, keep | {version})
     return version_dir
+
+
+def prune_versions(model_dir: str, keep: set[int]) -> None:
+    for entry in os.listdir(model_dir):
+        if entry.isdigit() and int(entry) not in keep:
+            shutil.rmtree(os.path.join(model_dir, entry), ignore_errors=True)

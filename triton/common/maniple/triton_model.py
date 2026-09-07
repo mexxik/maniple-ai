@@ -11,6 +11,8 @@ Protocol (every request addresses ONE named policy; rows in the tensors are agen
   command=observe   obs action reward done [agent_id episode_id policy_version logp]   feed transitions
   command=status
   command=export                     force an export now
+  command=report    version score [episodes]   a client's greedy evaluation of a version (drives 'best')
+  command=promote   version                    pin the 'stable' channel to a version
 Output: 'status' = JSON {ok, error?, name, version, updates, buffered, total_samples, ...}
 """
 
@@ -96,6 +98,17 @@ class AlgorithmModel:
             return self._status({"ok": True, **policy.status()})
         if command == "export":
             return self._status({"ok": True, "exported_version": policy.export(), **policy.status()})
+        if command == "report":
+            version = int(_arr(req, "version").reshape(-1)[0])
+            score = float(_arr(req, "score").reshape(-1)[0])
+            episodes_t = _arr(req, "episodes")
+            episodes = int(episodes_t.reshape(-1)[0]) if episodes_t is not None else 1
+            policy.report(version, score, episodes)
+            return self._status({"ok": True, **policy.status()})
+        if command == "promote":
+            version = int(_arr(req, "version").reshape(-1)[0])
+            policy.promote(version)
+            return self._status({"ok": True, **policy.status()})
         return self._status({"ok": False, "error": f"unknown command '{command}'"})
 
     @staticmethod
