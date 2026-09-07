@@ -4,8 +4,10 @@
 #include "ManipleInferenceTypes.h"
 
 /**
- * Triton client over gRPC (GRPCInferenceService). One channel per client; requests use
- * raw_input_contents / raw_output_contents (no per-element encoding).
+ * Triton client over gRPC (GRPCInferenceService). One channel per client. Inference goes through a
+ * single persistent bidirectional ModelStreamInfer stream (opened at construction, reconnected on failure);
+ * requests carry an id and responses are matched by it. Tensors use raw_input_contents /
+ * raw_output_contents (no per-element encoding).
  *
  * Async methods must be called from the game thread; completions are delivered on the game thread
  * during the engine tick (or by the *Sync variants, which pump until done). Thread-safe internally.
@@ -36,8 +38,12 @@ public:
 	/** Number of requests in flight. */
 	int32 NumPending() const;
 
+	/** True while the inference stream is open. */
+	bool IsStreamConnected() const;
+
+	struct FImpl;   // opaque, defined in the .cpp
+
 private:
-	struct FImpl;
 	TUniquePtr<FImpl> Impl;
 	FString Target;
 	float TimeoutSec;
