@@ -18,17 +18,28 @@ PPO runs inside Triton (`triton/model_repository/ppo_train`), actions come from 
     # continuous actions
     .venv/bin/python run.py --env Pendulum-v1 --name pendulum --agents 16 --steps 20000
 
-    # bigger net, larger rollout per update (LunarLander needs: .venv/bin/pip install "gymnasium[box2d]")
-    .venv/bin/python run.py --env LunarLander-v3 --name lander --agents 32 --steps 50000 --hidden 128,128 --rollout 8192
+    # network presets and options (LunarLander needs: .venv/bin/pip install "gymnasium[box2d]")
+    .venv/bin/python run.py --env LunarLander-v3 --name lander --agents 32 --steps 50000 --net medium --rollout 8192
+    .venv/bin/python run.py --env LunarLander-v3 --name lander2 --hidden 512,512,256 --activation relu --layernorm
 
-    # keep training an existing policy: same --name resumes from the checkpoint and the last exported version
-    .venv/bin/python run.py --env CartPole-v1 --name cartpole --steps 4000
+    # keep training an existing policy with the spec it was created with (network/PPO flags are ignored)
+    .venv/bin/python run.py --env CartPole-v1 --name cartpole --steps 4000 --resume
 
     # remote server
     .venv/bin/python run.py --url gpubox:8001 --env CartPole-v1 --name cartpole
 
-Options: `--agents` parallel envs, `--steps` env steps per env, `--rollout` transitions per PPO update,
-`--hidden` layer sizes, `--no-explore` greedy actions (for evaluation runs only).
+Options (`run.py --help` lists them all):
+
+| group | flags |
+|---|---|
+| run | `--agents` parallel envs, `--steps` per env, `--no-explore` greedy actions |
+| network | `--net auto\|small\|medium\|large\|custom`, `--hidden 512,512` (custom), `--activation tanh\|relu\|elu\|gelu`, `--layernorm`, `--shared-critic`, `--no-normalize-obs` |
+| ppo | `--rollout`, `--epochs`, `--minibatch`, `--lr`, `--gamma`, `--entropy`, `--max-lag` |
+
+`--net auto` (default) sizes two hidden layers from the observation size; presets are 64x64 / 256x256 / 512x512x256.
+A policy name keeps the spec it was created with: changing network or PPO options for an existing `--name` is
+rejected, use a new name (or delete the policy, see below). The resolved network is printed at start and is in
+every `status`.
 
 ## Play
 

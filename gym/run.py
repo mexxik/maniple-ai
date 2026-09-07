@@ -27,14 +27,34 @@ def parse_args():
     parser.add_argument("--name", default="cartpole", help="policy name on the server")
     parser.add_argument("--agents", type=int, default=16, help="parallel environments")
     parser.add_argument("--steps", type=int, default=3000, help="environment steps per agent")
-    parser.add_argument("--rollout", type=int, default=2048, help="transitions per PPO update")
-    parser.add_argument("--hidden", default="64,64", help="hidden layer sizes")
     parser.add_argument("--no-explore", action="store_true", help="act greedily (evaluation only)")
+    parser.add_argument(
+        "--resume", action="store_true", help="continue an existing policy with its stored spec"
+    )
+
+    net = parser.add_argument_group("network (see triton/common/maniple/spec.py)")
+    net.add_argument("--net", default="auto", help="auto | small | medium | large | custom")
+    net.add_argument("--hidden", default=None, help="layer sizes for --net custom, e.g. 512,512,256")
+    net.add_argument("--activation", default="tanh", choices=["tanh", "relu", "elu", "gelu"])
+    net.add_argument("--layernorm", action="store_true", help="LayerNorm after every hidden layer")
+    net.add_argument("--shared-critic", action="store_true", help="value head on the actor torso")
+    net.add_argument(
+        "--no-normalize-obs", action="store_true", help="disable running observation normalisation"
+    )
+
+    ppo = parser.add_argument_group("ppo")
+    ppo.add_argument("--rollout", type=int, default=2048, help="transitions per update")
+    ppo.add_argument("--epochs", type=int, default=4)
+    ppo.add_argument("--minibatch", type=int, default=256)
+    ppo.add_argument("--lr", type=float, default=3e-4)
+    ppo.add_argument("--gamma", type=float, default=0.99)
+    ppo.add_argument("--entropy", type=float, default=0.01, help="entropy bonus coefficient")
+    ppo.add_argument("--max-lag", type=int, default=4, help="drop rows older than this many policy versions")
     return parser.parse_args()
 
 
-def make_spec(envs, hidden, rollout):
-    """Build the AgentSpec the trainer needs from the environment's spaces."""
+def make_spec(envs, args):
+    """Build the AgentSpec the trainer needs from the environment's spaces and the CLI options."""
     obs_dim = int(np.prod(envs.single_observation_space.shape))
     space = envs.single_action_space
 
@@ -48,15 +68,24 @@ def make_spec(envs, hidden, rollout):
             "high": float(space.high.max()),
         }
 
-    ppo = {
-        "rollout": rollout,
-        "epochs": 4,
-        "minibatch": 256,
-        "lr": 3e-4,
-        "entropy_coef": 0.01,
-        "max_policy_lag": 4,
+    net = {
+        "preset": "custom" if args.hidden else args.net,
+        "hidden": [int(h) for h in args.hidden.split(",")] if args.hidden else [],
+        "activation": args.activation,
+        "layernorm": args.layernorm,
+        "separate_critic": not args.shared_critic,
+        "normalize_obs": not args.no_normalize_obs,
     }
-    return {"obs": {"dim": obs_dim}, "action": action, "hidden": hidden, "ppo": ppo}
+    ppo = {
+        "rollout": args.rollout,
+        "epochs": args.epochs,
+        "minibatch": args.minibatch,
+        "lr": args.lr,
+        "gamma": args.gamma,
+        "entropy_coef": args.entropy,
+        "max_policy_lag": args.max_lag,
+    }
+    return {"obs": {"dim": obs_dim}, "action": action, "net": net, "ppo": ppo}
 
 
 def to_env_action(action, action_index, action_space):
@@ -70,11 +99,19 @@ def main():
     args = parse_args()
 
     envs = gym.vector.SyncVectorEnv([lambda: gym.make(args.env) for _ in range(args.agents)])
-    hidden = [int(h) for h in args.hidden.split(",")]
-    spec = make_spec(envs, hidden, args.rollout)
-
     agent = TritonAgent(args.url, args.name)
-    print("register:", agent.register(spec))
+
+    spec = make_spec(envs, args)
+    if args.resume:
+        stored = agent.stored_spec()
+        if stored is None:
+            print(f"no policy '{args.name}' on the server yet, creating it")
+        else:
+            spec = stored  # network and PPO flags are ignored on resume
+    status = agent.register(spec)
+    print(
+        f"policy '{args.name}' v{status['version']} ({status['updates']} updates so far), net: {status['net']}"
+    )
     agent.wait_until_ready()
 
     # per-environment bookkeeping the trainer needs to stitch trajectories

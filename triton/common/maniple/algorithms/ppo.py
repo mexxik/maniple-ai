@@ -48,10 +48,13 @@ class PPO(Algorithm):
         return {"model": self.model.state_dict(), "optimizer": self.optimizer.state_dict()}
 
     def load_state_dict(self, state):
-        self.model.load_state_dict(state["model"])
+        # strict=False: checkpoints from before a net option existed (e.g. the obs normalizer) still load
+        self.model.load_state_dict(state["model"], strict=False)
         self.optimizer.load_state_dict(state["optimizer"])
 
     def update(self, trajectories):
+        all_obs = torch.as_tensor(np.concatenate([t["obs"] for t in trajectories]), device=self.device)
+        self.model.actor.normalizer.update(all_obs)
         batch = self._prepare_batch(trajectories)
         return self._optimize(batch)
 

@@ -7,6 +7,7 @@ and checkpoints. Algorithm-agnostic: pass the Algorithm class at construction.
 
 from __future__ import annotations
 
+import json
 import os
 import threading
 import time
@@ -106,6 +107,8 @@ class Policy:
             "buffered": len(self.buffer),
             "total_samples": self.total_samples,
             "dropped_stale": self.buffer.dropped_stale,
+            "net": self.spec.describe(),
+            "spec": json.loads(self.spec.to_json()),
             "stats": self.last_stats,
         }
 
@@ -133,10 +136,16 @@ class PolicyRegistry:
     def get_or_create(self, name: str, spec: AgentSpec) -> Policy:
         with self._lock:
             p = self._policies.get(name)
-            if p is None:
-                p = Policy(name, spec, self)
-                p.start()  # may raise; then nothing is registered
-                self._policies[name] = p
+            if p is not None:
+                if p.spec.to_json() != spec.to_json():
+                    raise ValueError(
+                        f"policy '{name}' exists with a different spec; use another name, or delete "
+                        f"model_repository/{name}_policy and checkpoints/{name} to start over"
+                    )
+                return p
+            p = Policy(name, spec, self)
+            p.start()  # may raise; then nothing is registered
+            self._policies[name] = p
             return p
 
     def load_all(self):
@@ -149,7 +158,13 @@ class PolicyRegistry:
             with open(os.path.join(d, "spec.json")) as f:
                 spec = AgentSpec.from_json(f.read())
             p = Policy(name, spec, self)
-            p.restore(d)
+            try:
+                p.restore(d)
+            except Exception as e:  # noqa: BLE001 - a broken checkpoint must not take the server down
+                print(
+                    f"[maniple] policy '{name}': checkpoint not restored ({type(e).__name__}: {e}); skipped"
+                )
+                continue
             self._policies[name] = p
             p.start()
 

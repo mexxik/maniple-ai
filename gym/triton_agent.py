@@ -56,6 +56,13 @@ class TritonAgent:
     def status(self):
         return self._train_call("status")
 
+    def stored_spec(self):
+        """The spec an existing policy was created with, or None if the name is unknown."""
+        try:
+            return self.status()["spec"]
+        except RuntimeError:
+            return None
+
     def wait_until_ready(self, timeout_sec=60):
         """The exported policy model appears a moment after register(); block until Triton serves it."""
         import time
