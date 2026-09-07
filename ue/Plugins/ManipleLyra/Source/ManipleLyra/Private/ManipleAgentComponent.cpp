@@ -1,19 +1,15 @@
 #include "ManipleAgentComponent.h"
 #include "ManipleLyra.h"
-#include "ManipleTritonClient.h"
 #include "Character/LyraCharacter.h"
 #include "Character/LyraHealthComponent.h"
 #include "Teams/LyraTeamSubsystem.h"
 #include "AbilitySystem/LyraAbilitySystemComponent.h"
 #include "AIController.h"
 #include "BrainComponent.h"
-#include "GameFramework/Controller.h"
-#include "GameFramework/PawnMovementComponent.h"
 #include "EngineUtils.h"
 #include "Engine/World.h"
 #include "CollisionQueryParams.h"
 #include "GameplayTagContainer.h"
-#include "TimerManager.h"
 
 using namespace ManipleLyra;
 
@@ -21,13 +17,6 @@ UManipleAgentComponent::UManipleAgentComponent()
 {
 	PrimaryComponentTick.bCanEverTick = true;
 	PrimaryComponentTick.TickGroup = TG_PrePhysics;
-}
-
-void UManipleAgentComponent::Init(const FManipleBotConfig& InConfig, TSharedPtr<FManipleTritonClient> InClient, int32 InAgentId)
-{
-	Config = InConfig;
-	Client = InClient;
-	AgentId = InAgentId;
 }
 
 void UManipleAgentComponent::BeginPlay()
@@ -42,14 +31,7 @@ void UManipleAgentComponent::BeginPlay()
 		return;
 	}
 	TakeOverFromBehaviorTree();
-	GetWorld()->GetTimerManager().SetTimer(DecisionTimerHandle, this, &UManipleAgentComponent::Decide, 1.f / Config.DecisionHz, true, 0.2f);
 	UE_LOG(LogManipleLyra, Display, TEXT("agent %d: took over %s (%s)"), AgentId, *Character->GetName(), *AI->GetName());
-}
-
-void UManipleAgentComponent::EndPlay(const EEndPlayReason::Type Reason)
-{
-	if (UWorld* W = GetWorld()) W->GetTimerManager().ClearTimer(DecisionTimerHandle);
-	Super::EndPlay(Reason);
 }
 
 void UManipleAgentComponent::TakeOverFromBehaviorTree()
@@ -62,9 +44,16 @@ void UManipleAgentComponent::TakeOverFromBehaviorTree()
 	AI->ClearFocus(EAIFocusPriority::Gameplay);
 }
 
+bool UManipleAgentComponent::IsReady() const
+{
+	if (!Character.IsValid() || !AI.IsValid()) return false;
+	const ULyraHealthComponent* H = ULyraHealthComponent::FindHealthComponent(Character.Get());
+	return H && !H->IsDeadOrDying();
+}
+
 void UManipleAgentComponent::BuildObservation(TArray<float>& Obs) const
 {
-	Obs.Init(0.f, ObsDim);
+	Obs.SetNumZeroed(ObsDim);
 	const ALyraCharacter* Me = Character.Get();
 	const FRotator Frame(0.f, AI->GetControlRotation().Yaw, 0.f);
 	const FVector MyLoc = Me->GetActorLocation();
@@ -77,7 +66,6 @@ void UManipleAgentComponent::BuildObservation(TArray<float>& Obs) const
 		Obs[ObsHealth] = H->GetMaxHealth() > 0.f ? H->GetHealth() / H->GetMaxHealth() : 0.f;
 	}
 
-	// nearest living enemies
 	struct FEnemy { const ALyraCharacter* C; float Dist; float Health; };
 	TArray<FEnemy> Enemies;
 	const ULyraTeamSubsystem* Teams = GetWorld()->GetSubsystem<ULyraTeamSubsystem>();
@@ -107,54 +95,21 @@ void UManipleAgentComponent::BuildObservation(TArray<float>& Obs) const
 	Obs[ObsPad + 1] = 1.f; // bias
 }
 
-void UManipleAgentComponent::Decide()
+void UManipleAgentComponent::SetAction(TConstArrayView<float> InAction)
 {
-	if (!Character.IsValid() || !AI.IsValid()) return;
-	if (const ULyraHealthComponent* H = ULyraHealthComponent::FindHealthComponent(Character.Get()))
-	{
-		if (H->IsDeadOrDying()) { bHasAction = false; return; }
-	}
-
-	if (Config.Brain == EManipleBrain::Random)
-	{
-		Action[ActMoveFwd] = FMath::FRandRange(-1.f, 1.f);
-		Action[ActMoveRight] = FMath::FRandRange(-1.f, 1.f);
-		Action[ActYawRate] = FMath::FRandRange(-1.f, 1.f);
-		Action[ActPitchRate] = FMath::FRandRange(-0.3f, 0.3f);
-		Action[ActFire] = FMath::FRand() < 0.3f ? 1.f : -1.f;
-		Action[ActJump] = FMath::FRand() < 0.05f ? 1.f : -1.f;
-		bHasAction = true;
-		++Decisions;
-		return;
-	}
-
-	if (bInferPending || !Client.IsValid()) return;
-	TArray<float> Obs;
-	BuildObservation(Obs);
-	const int64 Shape[2] = { 1, ObsDim };
-	bInferPending = true;
-	TWeakObjectPtr<UManipleAgentComponent> Weak(this);
-	Client->Infer(Config.Model, { FManipleTensor::MakeFloat(TEXT("obs"), Shape, Obs) },
-		FManipleInferComplete::CreateLambda([Weak](const FManipleInferResult& R) { if (Weak.IsValid()) Weak->OnInferComplete(R); }));
+	if (InAction.Num() < ActDim) return;
+	for (int32 i = 0; i < ActDim; ++i) Action[i] = InAction[i];
+	bHasAction = true;
 }
 
-void UManipleAgentComponent::OnInferComplete(const FManipleInferResult& R)
+void UManipleAgentComponent::SetRandomAction()
 {
-	bInferPending = false;
-	++Decisions;
-	LatencySumMs += R.LatencyMs;
-	const FManipleTensor* Out = R.bSuccess ? R.FindOutput(TEXT("action")) : nullptr;
-	if (!Out || Out->AsFloats().Num() < ActDim)
-	{
-		++Failures;
-		if (Failures <= 3 || Failures % 100 == 0)
-		{
-			UE_LOG(LogManipleLyra, Warning, TEXT("agent %d: infer failed (%d): %s"), AgentId, Failures, *R.Error);
-		}
-		return;
-	}
-	TConstArrayView<float> A = Out->AsFloats();
-	for (int32 i = 0; i < ActDim; ++i) Action[i] = A[i];
+	Action[ActMoveFwd] = FMath::FRandRange(-1.f, 1.f);
+	Action[ActMoveRight] = FMath::FRandRange(-1.f, 1.f);
+	Action[ActYawRate] = FMath::FRandRange(-1.f, 1.f);
+	Action[ActPitchRate] = FMath::FRandRange(-0.3f, 0.3f);
+	Action[ActFire] = FMath::FRand() < 0.3f ? 1.f : -1.f;
+	Action[ActJump] = FMath::FRand() < 0.05f ? 1.f : -1.f;
 	bHasAction = true;
 }
 
@@ -163,7 +118,6 @@ void UManipleAgentComponent::ApplyAction(float DeltaTime)
 	ALyraCharacter* Me = Character.Get();
 	AAIController* Ctrl = AI.Get();
 
-	// keep the behaviour tree from resuming (e.g. after re-possess)
 	if (UBrainComponent* Brain = Ctrl->FindComponentByClass<UBrainComponent>())
 	{
 		if (Brain->IsRunning()) Brain->StopLogic(TEXT("Maniple"));
@@ -190,13 +144,13 @@ void UManipleAgentComponent::ApplyAction(float DeltaTime)
 			bWantFire ? ASC->AbilityInputTagPressed(FireTag) : ASC->AbilityInputTagReleased(FireTag);
 			bFiring = bWantFire;
 		}
-		ASC->ProcessAbilityInput(DeltaTime, false); // bots have no player controller to do this
+		ASC->ProcessAbilityInput(DeltaTime, false); // bots have no player controller doing this
 	}
 }
 
 void UManipleAgentComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)
 {
 	Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
-	if (!bHasAction || !Character.IsValid() || !AI.IsValid()) return;
+	if (!bHasAction || !IsReady()) return;
 	ApplyAction(DeltaTime);
 }

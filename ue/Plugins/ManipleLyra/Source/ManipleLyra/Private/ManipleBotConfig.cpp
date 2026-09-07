@@ -22,12 +22,15 @@ FManipleBotConfig FManipleBotConfig::FromCommandLine()
 	}
 	FParse::Value(Cmd, TEXT("ManipleHz="), C.DecisionHz);
 	C.DecisionHz = FMath::Clamp(C.DecisionHz, 1.f, 60.f);
+	int32 Batch = 1;
+	if (FParse::Value(Cmd, TEXT("ManipleBatch="), Batch)) C.bBatch = Batch != 0;
+	FParse::Value(Cmd, TEXT("ManipleSpawnBots="), C.SpawnBots);
 	return C;
 }
 
 FString FManipleBotConfig::ToString() const
 {
 	const TCHAR* BrainStr = Brain == EManipleBrain::Random ? TEXT("random") : Brain == EManipleBrain::Triton ? TEXT("triton") : TEXT("none");
-	return FString::Printf(TEXT("brain=%s model=%s url=%s bots=%s hz=%.0f"), BrainStr, *Model, *TritonUrl,
-		MaxBots < 0 ? TEXT("all") : *FString::FromInt(MaxBots), DecisionHz);
+	return FString::Printf(TEXT("brain=%s model=%s url=%s bots=%s hz=%.0f batch=%d spawn=%d"), BrainStr, *Model, *TritonUrl,
+		MaxBots < 0 ? TEXT("all") : *FString::FromInt(MaxBots), DecisionHz, bBatch ? 1 : 0, SpawnBots);
 }
