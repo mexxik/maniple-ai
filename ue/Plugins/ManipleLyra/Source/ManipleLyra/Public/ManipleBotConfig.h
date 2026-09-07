@@ -4,9 +4,9 @@
 
 enum class EManipleBrain : uint8
 {
-	None,    // Lyra behaviour-tree bots, untouched (default)
-	Random,  // take over bots, random actions, no server
-	Triton   // take over bots, actions from the Triton model
+	None, // Lyra behaviour-tree bots, untouched (default)
+	Random, // take over bots, random actions, no server
+	Triton // take over bots, actions from the Triton model
 };
 
 /**
@@ -21,7 +21,7 @@ struct MANIPLELYRA_API FManipleBotConfig
 	EManipleBrain Brain = EManipleBrain::None;
 	FString Model = TEXT("lyra_policy");
 	FString TritonUrl = TEXT("localhost:8001");
-	int32 MaxBots = -1;        // -1 = all
+	int32 MaxBots = -1; // -1 = all
 	float DecisionHz = 10.f;
 	bool bBatch = true;
 	int32 SpawnBots = 0;

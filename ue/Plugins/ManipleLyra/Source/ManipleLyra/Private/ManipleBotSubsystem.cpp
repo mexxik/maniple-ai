@@ -17,9 +17,11 @@ using namespace ManipleLyra;
 
 bool UManipleBotSubsystem::ShouldCreateSubsystem(UObject* Outer) const
 {
-	if (!Super::ShouldCreateSubsystem(Outer)) return false;
+	if (!Super::ShouldCreateSubsystem(Outer))
+		return false;
 	const UWorld* World = Cast<UWorld>(Outer);
-	if (!World || !(World->WorldType == EWorldType::Game || World->WorldType == EWorldType::PIE)) return false;
+	if (!World || !(World->WorldType == EWorldType::Game || World->WorldType == EWorldType::PIE))
+		return false;
 	return FManipleBotConfig::FromCommandLine().IsActive();
 }
 
@@ -45,19 +47,33 @@ void UManipleBotSubsystem::Deinitialize()
 void UManipleBotSubsystem::Tick(float DeltaTime)
 {
 	UWorld* World = GetWorld();
-	if (!World || !World->HasBegunPlay() || World->GetNetMode() == NM_Client) return;
+	if (!World || !World->HasBegunPlay() || World->GetNetMode() == NM_Client)
+		return;
 
-	++WinFrames; WinFrameSec += DeltaTime;
+	++WinFrames;
+	WinFrameSec += DeltaTime;
 
 	ScanTimer += DeltaTime;
-	if (ScanTimer >= 0.5f) { ScanTimer = 0.f; ScanForBots(); }
+	if (ScanTimer >= 0.5f)
+	{
+		ScanTimer = 0.f;
+		ScanForBots();
+	}
 
 	DecisionTimer += DeltaTime;
 	const float Period = 1.f / Config.DecisionHz;
-	if (DecisionTimer >= Period) { DecisionTimer = FMath::Fmod(DecisionTimer, Period); Decide(); }
+	if (DecisionTimer >= Period)
+	{
+		DecisionTimer = FMath::Fmod(DecisionTimer, Period);
+		Decide();
+	}
 
 	StatsTimer += DeltaTime;
-	if (StatsTimer >= 5.f) { StatsTimer = 0.f; LogStats(); }
+	if (StatsTimer >= 5.f)
+	{
+		StatsTimer = 0.f;
+		LogStats();
+	}
 }
 
 void UManipleBotSubsystem::SpawnExtraBots()
@@ -72,7 +88,8 @@ void UManipleBotSubsystem::SpawnExtraBots()
 		UE_LOG(LogManipleLyra, Warning, TEXT("cannot spawn extra bots: LyraBotCreationComponent/SpawnOneBot not found"));
 		return;
 	}
-	for (int32 i = 0; i < Config.SpawnBots; ++i) Comp->ProcessEvent(Fn, nullptr);
+	for (int32 i = 0; i < Config.SpawnBots; ++i)
+		Comp->ProcessEvent(Fn, nullptr);
 	UE_LOG(LogManipleLyra, Display, TEXT("spawned %d extra bots"), Config.SpawnBots);
 }
 
@@ -86,11 +103,13 @@ void UManipleBotSubsystem::ScanForBots()
 		++BotControllers;
 		AAIController* Ctrl = *It;
 		APawn* Pawn = Ctrl->GetPawn();
-		if (!Pawn || Pawn->FindComponentByClass<UManipleAgentComponent>()) continue;
+		if (!Pawn || Pawn->FindComponentByClass<UManipleAgentComponent>())
+			continue;
 
 		if (!OwnedControllers.Contains(Ctrl))
 		{
-			if (Config.MaxBots >= 0 && OwnedControllers.Num() >= Config.MaxBots) continue;
+			if (Config.MaxBots >= 0 && OwnedControllers.Num() >= Config.MaxBots)
+				continue;
 			OwnedControllers.Add(Ctrl);
 		}
 		UManipleAgentComponent* Agent = NewObject<UManipleAgentComponent>(Pawn, TEXT("ManipleAgent"));
@@ -109,16 +128,19 @@ void UManipleBotSubsystem::ScanForBots()
 	for (const TWeakObjectPtr<AAIController>& C : OwnedControllers)
 	{
 		APawn* Pawn = C.IsValid() ? C->GetPawn() : nullptr;
-		if (UManipleAgentComponent* A = Pawn ? Pawn->FindComponentByClass<UManipleAgentComponent>() : nullptr) Agents.Add(A);
+		if (UManipleAgentComponent* A = Pawn ? Pawn->FindComponentByClass<UManipleAgentComponent>() : nullptr)
+			Agents.Add(A);
 	}
 }
 
 void UManipleBotSubsystem::OnTickResponse(int32 TickId, bool bOk, double LatencyMs)
 {
 	++WinRequests;
-	if (!bOk) ++WinFailures;
+	if (!bOk)
+		++WinFailures;
 	FTickTrack* T = OpenTicks.Find(TickId);
-	if (!T) return;
+	if (!T)
+		return;
 	if (++T->Received >= T->Expected)
 	{
 		WinTickLatencyMs.Add((FPlatformTime::Seconds() - T->StartSec) * 1000.0);
@@ -132,19 +154,25 @@ void UManipleBotSubsystem::Decide()
 	TArray<UManipleAgentComponent*> Ready;
 	for (const TWeakObjectPtr<UManipleAgentComponent>& W : Agents)
 	{
-		if (W.IsValid() && W->IsReady()) Ready.Add(W.Get());
+		if (W.IsValid() && W->IsReady())
+			Ready.Add(W.Get());
 	}
-	if (Ready.Num() == 0) return;
+	if (Ready.Num() == 0)
+		return;
 
 	if (Config.Brain == EManipleBrain::Random)
 	{
-		for (UManipleAgentComponent* A : Ready) A->SetRandomAction();
-		WinTickLatencyMs.Add(0.0); ++WinTicks; WinRequests += Ready.Num();
+		for (UManipleAgentComponent* A : Ready)
+			A->SetRandomAction();
+		WinTickLatencyMs.Add(0.0);
+		++WinTicks;
+		WinRequests += Ready.Num();
 		return;
 	}
 
 	const int32 TickId = NextTickId++;
-	FTickTrack Track; Track.StartSec = FPlatformTime::Seconds();
+	FTickTrack Track;
+	Track.StartSec = FPlatformTime::Seconds();
 	TArray<float> Obs;
 	TWeakObjectPtr<UManipleBotSubsystem> Self(this);
 
@@ -154,54 +182,84 @@ void UManipleBotSubsystem::Decide()
 		{
 			A->BuildObservation(Obs);
 			TWeakObjectPtr<UManipleAgentComponent> WA(A);
-			Batch->Submit(Obs, [WA](bool bOk, TConstArrayView<float> Out) { if (bOk && WA.IsValid()) WA->SetAction(Out); });
+			Batch->Submit(Obs,
+				[WA](bool bOk, TConstArrayView<float> Out)
+				{
+					if (bOk && WA.IsValid())
+						WA->SetAction(Out);
+				});
 		}
 		Track.Expected = 1;
 		OpenTicks.Add(TickId, Track);
-		Batch->Flush([Self, TickId](const FManipleInferResult& R, int32 Rows) { if (Self.IsValid()) Self->OnTickResponse(TickId, R.bSuccess, R.LatencyMs); });
+		Batch->Flush(
+			[Self, TickId](const FManipleInferResult& R, int32 Rows)
+			{
+				if (Self.IsValid())
+					Self->OnTickResponse(TickId, R.bSuccess, R.LatencyMs);
+			});
 		return;
 	}
 
 	// one request per agent; skip agents whose previous request is still in flight
 	for (UManipleAgentComponent* A : Ready)
 	{
-		if (A->bInferPending) continue;
+		if (A->bInferPending)
+			continue;
 		A->BuildObservation(Obs);
-		const int64 Shape[2] = { 1, ObsDim };
+		const int64 Shape[2] = {1, ObsDim};
 		A->bInferPending = true;
 		++Track.Expected;
 		TWeakObjectPtr<UManipleAgentComponent> WA(A);
-		Client->Infer(Config.Model, { FManipleTensor::MakeFloat(TEXT("obs"), Shape, Obs) },
-			FManipleInferComplete::CreateLambda([Self, WA, TickId](const FManipleInferResult& R)
-			{
-				const FManipleTensor* Out = R.bSuccess ? R.FindOutput(TEXT("action")) : nullptr;
-				if (WA.IsValid()) { WA->bInferPending = false; if (Out) WA->SetAction(Out->AsFloats()); }
-				if (Self.IsValid()) Self->OnTickResponse(TickId, Out != nullptr, R.LatencyMs);
-			}), { TEXT("action") });
+		Client->Infer(Config.Model, {FManipleTensor::MakeFloat(TEXT("obs"), Shape, Obs)},
+			FManipleInferComplete::CreateLambda(
+				[Self, WA, TickId](const FManipleInferResult& R)
+				{
+					const FManipleTensor* Out = R.bSuccess ? R.FindOutput(TEXT("action")) : nullptr;
+					if (WA.IsValid())
+					{
+						WA->bInferPending = false;
+						if (Out)
+							WA->SetAction(Out->AsFloats());
+					}
+					if (Self.IsValid())
+						Self->OnTickResponse(TickId, Out != nullptr, R.LatencyMs);
+				}),
+			{TEXT("action")});
 	}
-	if (Track.Expected > 0) OpenTicks.Add(TickId, Track);
+	if (Track.Expected > 0)
+		OpenTicks.Add(TickId, Track);
 }
 
 void UManipleBotSubsystem::LogStats()
 {
 	int32 Alive = 0;
-	for (const TWeakObjectPtr<UManipleAgentComponent>& W : Agents) if (W.IsValid() && W->IsReady()) ++Alive;
+	for (const TWeakObjectPtr<UManipleAgentComponent>& W : Agents)
+		if (W.IsValid() && W->IsReady())
+			++Alive;
 
 	double Avg = 0, P95 = 0, Max = 0;
 	if (WinTickLatencyMs.Num() > 0)
 	{
 		WinTickLatencyMs.Sort();
-		for (double L : WinTickLatencyMs) Avg += L;
+		for (double L : WinTickLatencyMs)
+			Avg += L;
 		Avg /= WinTickLatencyMs.Num();
 		P95 = WinTickLatencyMs[FMath::Min(WinTickLatencyMs.Num() - 1, (int32)(WinTickLatencyMs.Num() * 0.95))];
 		Max = WinTickLatencyMs.Last();
 	}
 	const TCHAR* Mode = Config.Brain == EManipleBrain::Random ? TEXT("random") : Config.bBatch ? TEXT("batch") : TEXT("peragent");
 	const double Sec = FMath::Max(WinFrameSec, 1e-6);
-	UE_LOG(LogManipleLyra, Display, TEXT("bench: mode=%s agents=%d alive=%d hz=%.0f ticks=%d lat_avg=%.2f lat_p95=%.2f lat_max=%.2f frame_avg=%.2f req_s=%.1f failures=%d open=%d"),
-		Mode, Agents.Num(), Alive, Config.DecisionHz, WinTicks, Avg, P95, Max, WinFrames > 0 ? WinFrameSec / WinFrames * 1000.0 : 0.0, WinRequests / Sec, WinFailures, OpenTicks.Num());
+	UE_LOG(LogManipleLyra, Display,
+		TEXT("bench: mode=%s agents=%d alive=%d hz=%.0f ticks=%d lat_avg=%.2f lat_p95=%.2f lat_max=%.2f frame_avg=%.2f req_s=%.1f "
+			 "failures=%d open=%d"),
+		Mode, Agents.Num(), Alive, Config.DecisionHz, WinTicks, Avg, P95, Max, WinFrames > 0 ? WinFrameSec / WinFrames * 1000.0 : 0.0,
+		WinRequests / Sec, WinFailures, OpenTicks.Num());
 
-	WinTicks = WinRequests = WinFailures = WinFrames = 0; WinFrameSec = 0.0; WinTickLatencyMs.Reset();
+	WinTicks = WinRequests = WinFailures = WinFrames = 0;
+	WinFrameSec = 0.0;
+	WinTickLatencyMs.Reset();
 	// drop ticks that never completed (timeouts) so they don't accumulate
-	for (auto It = OpenTicks.CreateIterator(); It; ++It) if (FPlatformTime::Seconds() - It->Value.StartSec > 5.0) It.RemoveCurrent();
+	for (auto It = OpenTicks.CreateIterator(); It; ++It)
+		if (FPlatformTime::Seconds() - It->Value.StartSec > 5.0)
+			It.RemoveCurrent();
 }

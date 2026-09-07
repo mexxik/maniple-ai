@@ -1,0 +1,4 @@
+gymnasium[classic-control]
+tritonclient[grpc]
+numpy
+imageio[ffmpeg]   # optional, for --video

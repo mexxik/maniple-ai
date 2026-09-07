@@ -1,0 +1,41 @@
+# Runs on staged files at commit time. One-time setup per clone:
+#   uvx pre-commit install
+# Whole repo:  uvx pre-commit run --all-files   (or scripts/lint.sh)
+#
+# Tool versions are pinned to match scripts/lint.sh.
+
+exclude: |
+  (?x)^(
+    third_party/.*
+    | ue/Plugins/ManipleInference/Source/ThirdParty/.*
+    | gym/\.venv/.*
+  )$
+
+repos:
+  # ---- Python: ruff formatter + linter (config in pyproject.toml)
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.14.14
+    hooks:
+      - id: ruff-format
+      - id: ruff-check
+        args: [--fix]
+
+  # ---- C++: clang-format, Unreal style (config in .clang-format)
+  - repo: https://github.com/pre-commit/mirrors-clang-format
+    rev: v20.1.8
+    hooks:
+      - id: clang-format
+        types_or: [c++, c]
+        files: ^ue/Plugins/.*/Source/.*\.(h|cpp)$
+
+  # ---- generic hygiene
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+        exclude: \.md$
+      - id: check-yaml
+      - id: check-added-large-files
+        args: [--maxkb=2048]
+      - id: check-merge-conflict

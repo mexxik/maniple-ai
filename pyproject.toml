@@ -1,0 +1,20 @@
+# Python tooling for the repo (ruff = formatter + linter). Run: scripts/lint.sh [--fix]
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+extend-exclude = ["third_party", ".venv", "ue"]
+
+[tool.ruff.lint]
+# E/W pycodestyle, F pyflakes, I isort, B bugbear, UP pyupgrade, SIM simplify
+select = ["E", "W", "F", "I", "B", "UP", "SIM"]
+ignore = [
+    "E501",   # line length is handled by the formatter
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["maniple"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"

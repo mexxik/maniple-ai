@@ -18,3 +18,11 @@ Then add `ue/Plugins/ManipleInference` (core: `FManipleTritonClient`, `FManipleB
 (`-ManipleBrain=triton` and friends, see the plugin header comments).
 
 Model artifacts (`*.onnx`, TensorRT plans) are not in git: fill `triton/model_repository/<model>/<version>/` yourself.
+
+## Code style
+
+    uvx pre-commit install   # once per clone: the same checks run on staged files at every commit
+    scripts/lint.sh          # check the whole repo: ruff (Python, pyproject.toml) + clang-format (C++, Unreal style)
+    scripts/lint.sh --fix    # rewrite in place
+
+Runs the tools through `uvx`, nothing to install beyond [uv](https://docs.astral.sh/uv/).

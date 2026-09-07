@@ -42,14 +42,19 @@ private:
 	TSharedPtr<FManipleTritonClient> Client;
 	TSharedPtr<FManipleBatchInferer> Batch;
 	TArray<TWeakObjectPtr<AAIController>> OwnedControllers;
-	TArray<TWeakObjectPtr<UManipleAgentComponent>> Agents;   // refreshed each scan
+	TArray<TWeakObjectPtr<UManipleAgentComponent>> Agents; // refreshed each scan
 	int32 NextAgentId = 0;
 	bool bSpawnedExtra = false;
 
 	float ScanTimer = 0.f, DecisionTimer = 0.f, StatsTimer = 0.f;
 
 	// per decision-tick bookkeeping: latency = tick start -> last response of that tick
-	struct FTickTrack { int32 Expected = 0; int32 Received = 0; double StartSec = 0.0; };
+	struct FTickTrack
+	{
+		int32 Expected = 0;
+		int32 Received = 0;
+		double StartSec = 0.0;
+	};
 	TMap<int32, FTickTrack> OpenTicks;
 	int32 NextTickId = 0;
 

@@ -1,13 +1,20 @@
 services:
   triton:
-    image: nvcr.io/nvidia/tritonserver:26.07-py3
+    build: .                     # tritonserver + torch, see Dockerfile
+    image: maniple-triton:26.07
     container_name: maniple-triton
+    user: "${UID:-1000}:${GID:-1000}"   # files the trainer writes into the mounted repo stay owned by you
+    # --log-verbose=1
     command: >
       tritonserver --model-repository=/models
-      --model-control-mode=poll --repository-poll-secs=5
-      --log-verbose=1
+      --model-control-mode=poll --repository-poll-secs=1
     volumes:
       - ./model_repository:/models
+      - ./checkpoints:/checkpoints   # trainer state, survives restarts
+      - ./common:/common             # shared trainer code (maniple package)
+    environment:
+      PYTHONPATH: "/common:/opt/tritonserver/backends/dali/wheel/dali"   # keep the image's own path too
+      PYTHONDONTWRITEBYTECODE: "1"   # no root-owned __pycache__ in the mounted repo
     ports:
       - "8000:8000"   # HTTP (KServe v2)
       - "8001:8001"   # gRPC

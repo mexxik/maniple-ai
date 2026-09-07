@@ -29,8 +29,8 @@ public:
 	 */
 	void Infer(const FString& Model, TArray<FManipleTensor> Inputs, FManipleInferComplete OnComplete,
 		const TArray<FString>& OutputNames = {}, const FString& Version = FString());
-	FManipleInferResult InferSync(const FString& Model, TArray<FManipleTensor> Inputs,
-		const TArray<FString>& OutputNames = {}, const FString& Version = FString());
+	FManipleInferResult InferSync(
+		const FString& Model, TArray<FManipleTensor> Inputs, const TArray<FString>& OutputNames = {}, const FString& Version = FString());
 
 	/** Delivers finished completions to their callbacks. Called automatically each frame; also usable manually. */
 	void PumpCompletions();
@@ -41,7 +41,7 @@ public:
 	/** True while the inference stream is open. */
 	bool IsStreamConnected() const;
 
-	struct FImpl;   // opaque, defined in the .cpp
+	struct FImpl; // opaque, defined in the .cpp
 
 private:
 	TUniquePtr<FImpl> Impl;

@@ -1,0 +1,61 @@
+# Unreal Engine coding standard, as close as clang-format gets:
+# Allman braces, tabs, PascalCase is up to the author, pointers on the type (FVector* Ptr).
+# Applies to ue/Plugins/**/Source/**; generated and third-party code is excluded by scripts/lint.sh.
+---
+Language: Cpp
+BasedOnStyle: LLVM
+Standard: c++20
+
+UseTab: Always
+TabWidth: 4
+IndentWidth: 4
+ColumnLimit: 140
+
+BreakBeforeBraces: Allman
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortBlocksOnASingleLine: Never
+AllowShortLambdasOnASingleLine: Inline
+AllowShortCaseLabelsOnASingleLine: false
+
+PointerAlignment: Left
+ReferenceAlignment: Left
+SpaceAfterTemplateKeyword: true
+SpaceBeforeParens: ControlStatements
+
+AccessModifierOffset: -4
+IndentCaseLabels: false
+NamespaceIndentation: All
+IndentPPDirectives: None
+
+BinPackArguments: true
+BinPackParameters: true
+AlignAfterOpenBracket: DontAlign
+AlignOperands: false
+AlignTrailingComments: false
+AlignConsecutiveAssignments: false
+
+BreakConstructorInitializers: BeforeComma
+ConstructorInitializerIndentWidth: 4
+ContinuationIndentWidth: 4
+
+SortIncludes: false
+FixNamespaceComments: false
+ReflowComments: false
+
+MacroBlockBegin: "^BEGIN_.*"
+MacroBlockEnd: "^END_.*"
+StatementMacros:
+  - UPROPERTY
+  - UFUNCTION
+  - UCLASS
+  - USTRUCT
+  - UENUM
+  - UINTERFACE
+  - GENERATED_BODY
+  - GENERATED_UCLASS_BODY
+  - DECLARE_LOG_CATEGORY_EXTERN
+  - DEFINE_LOG_CATEGORY
+  - IMPLEMENT_MODULE
+  - IMPLEMENT_SIMPLE_AUTOMATION_TEST

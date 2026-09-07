@@ -38,7 +38,8 @@ void UManipleAgentComponent::TakeOverFromBehaviorTree()
 {
 	if (UBrainComponent* Brain = AI->FindComponentByClass<UBrainComponent>())
 	{
-		if (Brain->IsRunning()) Brain->StopLogic(TEXT("Maniple"));
+		if (Brain->IsRunning())
+			Brain->StopLogic(TEXT("Maniple"));
 	}
 	AI->StopMovement();
 	AI->ClearFocus(EAIFocusPriority::Gameplay);
@@ -46,7 +47,8 @@ void UManipleAgentComponent::TakeOverFromBehaviorTree()
 
 bool UManipleAgentComponent::IsReady() const
 {
-	if (!Character.IsValid() || !AI.IsValid()) return false;
+	if (!Character.IsValid() || !AI.IsValid())
+		return false;
 	const ULyraHealthComponent* H = ULyraHealthComponent::FindHealthComponent(Character.Get());
 	return H && !H->IsDeadOrDying();
 }
@@ -59,24 +61,35 @@ void UManipleAgentComponent::BuildObservation(TArray<float>& Obs) const
 	const FVector MyLoc = Me->GetActorLocation();
 
 	const FVector LocalVel = Frame.UnrotateVector(Me->GetVelocity()) / VelScale;
-	Obs[ObsVel + 0] = LocalVel.X; Obs[ObsVel + 1] = LocalVel.Y; Obs[ObsVel + 2] = LocalVel.Z;
+	Obs[ObsVel + 0] = LocalVel.X;
+	Obs[ObsVel + 1] = LocalVel.Y;
+	Obs[ObsVel + 2] = LocalVel.Z;
 
 	if (const ULyraHealthComponent* H = ULyraHealthComponent::FindHealthComponent(Me))
 	{
 		Obs[ObsHealth] = H->GetMaxHealth() > 0.f ? H->GetHealth() / H->GetMaxHealth() : 0.f;
 	}
 
-	struct FEnemy { const ALyraCharacter* C; float Dist; float Health; };
+	struct FEnemy
+	{
+		const ALyraCharacter* C;
+		float Dist;
+		float Health;
+	};
 	TArray<FEnemy> Enemies;
 	const ULyraTeamSubsystem* Teams = GetWorld()->GetSubsystem<ULyraTeamSubsystem>();
 	for (TActorIterator<ALyraCharacter> It(GetWorld()); It; ++It)
 	{
 		const ALyraCharacter* Other = *It;
-		if (Other == Me) continue;
+		if (Other == Me)
+			continue;
 		const ULyraHealthComponent* OH = ULyraHealthComponent::FindHealthComponent(Other);
-		if (!OH || OH->IsDeadOrDying()) continue;
-		if (Teams && Teams->CompareTeams(Me, Other) != ELyraTeamComparison::DifferentTeams) continue;
-		Enemies.Add({ Other, (float)FVector::Dist(MyLoc, Other->GetActorLocation()), OH->GetMaxHealth() > 0.f ? OH->GetHealth() / OH->GetMaxHealth() : 0.f });
+		if (!OH || OH->IsDeadOrDying())
+			continue;
+		if (Teams && Teams->CompareTeams(Me, Other) != ELyraTeamComparison::DifferentTeams)
+			continue;
+		Enemies.Add({Other, (float)FVector::Dist(MyLoc, Other->GetActorLocation()),
+			OH->GetMaxHealth() > 0.f ? OH->GetHealth() / OH->GetMaxHealth() : 0.f});
 	}
 	Enemies.Sort([](const FEnemy& A, const FEnemy& B) { return A.Dist < B.Dist; });
 
@@ -90,15 +103,22 @@ void UManipleAgentComponent::BuildObservation(TArray<float>& Obs) const
 		FHitResult Hit;
 		const bool bBlocked = GetWorld()->LineTraceSingleByChannel(Hit, Eye, Target, ECC_Visibility, Params) && Hit.GetActor() != E.C;
 		float* O = &Obs[ObsEnemies + i * EnemyStride];
-		O[0] = Rel.X; O[1] = Rel.Y; O[2] = Rel.Z; O[3] = E.Dist / PosScale; O[4] = bBlocked ? 0.f : 1.f; O[5] = E.Health;
+		O[0] = Rel.X;
+		O[1] = Rel.Y;
+		O[2] = Rel.Z;
+		O[3] = E.Dist / PosScale;
+		O[4] = bBlocked ? 0.f : 1.f;
+		O[5] = E.Health;
 	}
 	Obs[ObsPad + 1] = 1.f; // bias
 }
 
 void UManipleAgentComponent::SetAction(TConstArrayView<float> InAction)
 {
-	if (InAction.Num() < ActDim) return;
-	for (int32 i = 0; i < ActDim; ++i) Action[i] = InAction[i];
+	if (InAction.Num() < ActDim)
+		return;
+	for (int32 i = 0; i < ActDim; ++i)
+		Action[i] = InAction[i];
 	bHasAction = true;
 }
 
@@ -120,7 +140,8 @@ void UManipleAgentComponent::ApplyAction(float DeltaTime)
 
 	if (UBrainComponent* Brain = Ctrl->FindComponentByClass<UBrainComponent>())
 	{
-		if (Brain->IsRunning()) Brain->StopLogic(TEXT("Maniple"));
+		if (Brain->IsRunning())
+			Brain->StopLogic(TEXT("Maniple"));
 	}
 
 	FRotator Rot = Ctrl->GetControlRotation();
@@ -133,7 +154,8 @@ void UManipleAgentComponent::ApplyAction(float DeltaTime)
 	Me->AddMovementInput(Frame.RotateVector(FVector::ForwardVector), FMath::Clamp(Action[ActMoveFwd], -1.f, 1.f));
 	Me->AddMovementInput(Frame.RotateVector(FVector::RightVector), FMath::Clamp(Action[ActMoveRight], -1.f, 1.f));
 
-	if (Action[ActJump] > 0.f && Me->CanJump()) Me->Jump();
+	if (Action[ActJump] > 0.f && Me->CanJump())
+		Me->Jump();
 
 	if (ULyraAbilitySystemComponent* ASC = Me->GetLyraAbilitySystemComponent())
 	{
@@ -151,6 +173,7 @@ void UManipleAgentComponent::ApplyAction(float DeltaTime)
 void UManipleAgentComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)
 {
 	Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
-	if (!bHasAction || !IsReady()) return;
+	if (!bHasAction || !IsReady())
+		return;
 	ApplyAction(DeltaTime);
 }

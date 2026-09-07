@@ -16,13 +16,16 @@ struct MANIPLEINFERENCE_API FManipleTensor
 	/** Bytes per element for the datatype, 0 if unknown/variable (BYTES). */
 	static int32 ElementSize(const FString& Datatype);
 	/** Typed views (no copy). Caller must check the datatype. */
-	TConstArrayView<float> AsFloats() const { return TConstArrayView<float>(reinterpret_cast<const float*>(Data.GetData()), Data.Num() / sizeof(float)); }
+	TConstArrayView<float> AsFloats() const
+	{
+		return TConstArrayView<float>(reinterpret_cast<const float*>(Data.GetData()), Data.Num() / sizeof(float));
+	}
 };
 
 struct MANIPLEINFERENCE_API FManipleInferResult
 {
 	bool bSuccess = false;
-	int32 StatusCode = 0;   // grpc::StatusCode (0 = OK)
+	int32 StatusCode = 0; // grpc::StatusCode (0 = OK)
 	FString Error;
 	FString ModelName;
 	FString ModelVersion;

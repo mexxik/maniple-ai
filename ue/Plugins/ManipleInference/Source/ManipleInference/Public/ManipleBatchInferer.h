@@ -17,8 +17,8 @@ public:
 	using FRowCallback = TFunction<void(bool bOk, TConstArrayView<float> Output)>;
 	using FBatchCallback = TFunction<void(const FManipleInferResult&, int32 Rows)>;
 
-	FManipleBatchInferer(TSharedPtr<FManipleTritonClient> InClient, const FString& InModel,
-		const FString& InInputName, int32 InInDim, const FString& InOutputName, int32 InOutDim);
+	FManipleBatchInferer(TSharedPtr<FManipleTritonClient> InClient, const FString& InModel, const FString& InInputName, int32 InInDim,
+		const FString& InOutputName, int32 InOutDim);
 
 	void Submit(TConstArrayView<float> Row, FRowCallback Callback);
 	int32 NumPending() const { return Callbacks.Num(); }

@@ -26,7 +26,7 @@ public:
 	virtual void BeginPlay() override;
 	virtual void TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction) override;
 
-	bool IsReady() const;              // possessed, alive, can act
+	bool IsReady() const; // possessed, alive, can act
 	void BuildObservation(TArray<float>& Obs) const;
 	void SetAction(TConstArrayView<float> InAction);
 	void SetRandomAction();

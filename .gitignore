@@ -18,7 +18,8 @@ out/
 *.safetensors
 *.gguf
 *.npz
-triton/model_repository/*/[0-9]*/
+triton/model_repository/*/[0-9]*/*
+!triton/model_repository/*/[0-9]*/model.py
 
 # misc
 .DS_Store
@@ -28,3 +29,16 @@ third_party/_build/
 ue/Plugins/ManipleInference/Source/ThirdParty/ManipleGrpc/lib/
 ue/Plugins/ManipleInference/Source/ThirdParty/ManipleGrpc/include/
 ue/Plugins/ManipleInference/Source/ThirdParty/ManipleGrpc/tools/
+triton/checkpoints/*
+!triton/checkpoints/.gitkeep
+
+# python
+__pycache__/
+*.pyc
+
+# policies exported by the trainer (config + versions are generated)
+triton/model_repository/*_policy/
+!triton/model_repository/lyra_policy/
+
+# python sandboxes
+.venv/
