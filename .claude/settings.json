@@ -7,7 +7,12 @@
       "Bash(.venv/bin/python -c ' *)",
       "Bash(.venv/bin/python run.py --help)",
       "Bash(cd /home/mexxik/maniple-ai/gym && grep -n \"_policy\\\\|self.name\" triton_agent.py | head -20; echo ---; ls ../triton/model_repository/)",
-      "Read(//home/mexxik/triton/**)"
+      "Read(//home/mexxik/triton/**)",
+      "Bash(gh --version)",
+      "Bash(gh auth *)",
+      "Bash(ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes -T git@github.com)",
+      "Bash(git remote *)",
+      "Bash(git ls-remote *)"
     ]
   }
 }
