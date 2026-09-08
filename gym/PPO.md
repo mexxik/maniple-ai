@@ -44,17 +44,19 @@ Hard exploration: reward is −1 per step until the goal. Plain PPO often never 
 entropy bonus and long runs, or treat it as a stress test.
 
     .venv/bin/python run.py  --env MountainCar-v0 --name mcar --agents 32 --steps 50000 --rollout 8192 --entropy 0.05
-    .venv/bin/python play.py --env MountainCar-v0 --name mcar --channel latest --episodes 3
+    DISPLAY=:0 .venv/bin/python play.py --env MountainCar-v0 --name mcar --channel latest --episodes 3
 
 ## Pendulum-v1 (continuous, 3 obs, 1 action in [−2, 2])
 
 Return per episode is in [−1600, 0]; a good policy stays above −200. Continuous actions exercise the
 `log_std` path and the `--net` options matter here.
 
-    .venv/bin/python run.py  --env Pendulum-v1 --name pendulum --agents 16 --steps 30000 --rollout 4096 --lr 1e-4 --gamma 0.95
+    .venv/bin/python run.py --env Pendulum-v1 --name pendulum2 --agents 16 --steps 30000 \
+  --rollout 4096 --lr 1e-3 --gamma 0.9 --entropy 0.0 --epochs 10
     .venv/bin/python play.py --env Pendulum-v1 --name pendulum --channel latest --episodes 5 --promote
     .venv/bin/python play.py --env Pendulum-v1 --name pendulum --episodes 10 --render none --report
-    DISPLAY=:0 .venv/bin/python play.py --env Pendulum-v1 --name pendulum --episodes 3 --fps 30
+    DISPLAY=:0 .venv/bin/python play.py --env Pendulum-v1 --name pendulum2 --channel best --episodes 3 --promote
+
 
 ## LunarLander-v3 (discrete, 8 obs, 4 actions) — needs `gymnasium[box2d]`
 
@@ -63,7 +65,7 @@ Solved at return 200 averaged over 100 episodes. Expect a few minutes.
     .venv/bin/python run.py  --env LunarLander-v3 --name lander --agents 32 --steps 60000 --rollout 8192 --net medium
     .venv/bin/python play.py --env LunarLander-v3 --name lander --channel latest --episodes 5 --promote
     .venv/bin/python play.py --env LunarLander-v3 --name lander --episodes 20 --render none --report
-    DISPLAY=:0 .venv/bin/python play.py --env LunarLander-v3 --name lander --episodes 3
+    DISPLAY=:0 .venv/bin/python play.py --env LunarLander-v3 --name lander --channel best --episodes 3
 
 Continuous variant:
 
@@ -73,9 +75,11 @@ Continuous variant:
 
 Long-horizon locomotion; the first real test of network size and normalisation. Solved at 300.
 
-    .venv/bin/python run.py  --env BipedalWalker-v3 --name walker --agents 32 --steps 200000 --rollout 16384 --net large --activation relu --lr 1e-4 --entropy 0.0
+    .venv/bin/python run.py --env BipedalWalker-v3 --name walker --agents 32 --steps 200000 \
+  --rollout 16384 --net large --activation relu --lr 1e-4 --gamma 0.999 --entropy 0.001 --epochs 10
+
     .venv/bin/python play.py --env BipedalWalker-v3 --name walker --channel latest --episodes 3 --promote
-    DISPLAY=:0 .venv/bin/python play.py --env BipedalWalker-v3 --name walker --episodes 2
+    DISPLAY=:0 .venv/bin/python play.py --env BipedalWalker-v3 --channel best --name walker --episodes 2
 
 ---
 
