@@ -65,6 +65,10 @@ class TritonAgent:
             episodes=np.array([episodes], dtype=np.int64),
         )
 
+    def export(self):
+        """Export the trainer's current version as a static model."""
+        return self._train_call("export")
+
     def promote(self, version):
         """Pin the 'stable' channel to a version."""
         return self._train_call("promote", version=np.array([version], dtype=np.int64))
@@ -80,7 +84,7 @@ class TritonAgent:
         """The exported policy model appears a moment after register(); block until Triton serves it."""
         import time
 
-        model = f"{self.name}_policy"
+        model = f"policy_{self.name}"
         deadline = time.time() + timeout_sec
         while time.time() < deadline:
             if self.client.is_model_ready(model):

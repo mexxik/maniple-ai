@@ -7,13 +7,14 @@ A concrete model is two lines:
         algorithm = PPO
 
 Protocol (every request addresses ONE named policy; rows in the tensors are agent steps):
-  command=register  spec=<json>     create the policy (idempotent) and export version 1
+  command=register  spec=<json>                              create the policy (idempotent)
+  command=act       obs [explore]                            actions from the CURRENT weights ('latest' channel)
   command=observe   obs action reward done [agent_id episode_id policy_version logp]   feed transitions
   command=status
-  command=export                     force an export now
-  command=report    version score [episodes]   a client's greedy evaluation of a version (drives 'best')
-  command=promote   version                    pin the 'stable' channel to a version
-Output: 'status' = JSON {ok, error?, name, version, updates, buffered, total_samples, ...}
+  command=export                                             write the current version as a static model
+  command=report    version score [episodes]                 a client's greedy evaluation of a version (drives 'best')
+  command=promote   version                                  pin 'stable' (exports if needed, builds TensorRT if enabled)
+Outputs: status (JSON) always; action / action_index / logp / policy_version filled for command=act.
 """
 
 from __future__ import annotations
@@ -41,6 +42,11 @@ def _arr(request, name):
     return None if t is None else t.as_numpy()
 
 
+def _scalar(request, name, default=None):
+    a = _arr(request, name)
+    return default if a is None else a.reshape(-1)[0]
+
+
 class AlgorithmModel:
     algorithm: type[Algorithm] = None  # set by the subclass
 
@@ -53,7 +59,6 @@ class AlgorithmModel:
             algorithm_cls=self.algorithm,
             model_repository=p.get("model_repository", "/models"),
             checkpoint_dir=p.get("checkpoint_dir", "/checkpoints"),
-            export_every_updates=int(p.get("export_every_updates", "1")),
             device="cuda" if args.get("model_instance_kind") == "GPU" else "cpu",
         )
         self.registry.load_all()
@@ -63,25 +68,36 @@ class AlgorithmModel:
         for req in requests:
             try:
                 responses.append(self._handle(req))
-            except Exception as e:  # a bad row must never take the server down
-                responses.append(self._status({"ok": False, "error": f"{type(e).__name__}: {e}"}))
+            except Exception as e:  # noqa: BLE001 - a bad row must never take the server down
+                responses.append(self._respond({"ok": False, "error": f"{type(e).__name__}: {e}"}))
         return responses
 
     def finalize(self):
         self.registry.shutdown()
 
-    # ---- protocol
+    # ------------------------------------------------------------------ protocol
+
     def _handle(self, req):
         name = _str(req, "name")
         command = _str(req, "command") or "observe"
+
         if command == "register":
             policy = self.registry.get_or_create(name, AgentSpec.from_json(_str(req, "spec")))
-            return self._status({"ok": True, **policy.status()})
+            return self._respond({"ok": True, **policy.status()})
+
         policy = self.registry.get(name)
         if policy is None:
-            return self._status(
+            return self._respond(
                 {"ok": False, "error": f"unknown policy '{name}': send command=register with spec first"}
             )
+
+        if command == "act":
+            obs = _arr(req, "obs").astype(np.float32)
+            explore = bool(_scalar(req, "explore", False))
+            action, index, logp = policy.act(obs, explore)
+            status = {"ok": True, "policy": name, "channel": "latest", "explore": explore}
+            return self._respond(status, action=action, index=index, logp=logp, version=policy.version)
+
         if command == "observe":
             n = policy.observe(
                 obs=_arr(req, "obs"),
@@ -93,25 +109,35 @@ class AlgorithmModel:
                 policy_version=_arr(req, "policy_version"),
                 logp=_arr(req, "logp"),
             )
-            return self._status({"ok": True, "accepted": int(n), **policy.status()})
+            return self._respond({"ok": True, "accepted": int(n), **policy.status()})
+
         if command == "status":
-            return self._status({"ok": True, **policy.status()})
+            return self._respond({"ok": True, **policy.status()})
+
         if command == "export":
-            return self._status({"ok": True, "exported_version": policy.export(), **policy.status()})
+            return self._respond({"ok": True, "exported_version": policy.export(), **policy.status()})
+
         if command == "report":
-            version = int(_arr(req, "version").reshape(-1)[0])
-            score = float(_arr(req, "score").reshape(-1)[0])
-            episodes_t = _arr(req, "episodes")
-            episodes = int(episodes_t.reshape(-1)[0]) if episodes_t is not None else 1
-            policy.report(version, score, episodes)
-            return self._status({"ok": True, **policy.status()})
+            policy.report(
+                int(_scalar(req, "version")), float(_scalar(req, "score")), int(_scalar(req, "episodes", 1))
+            )
+            return self._respond({"ok": True, **policy.status()})
+
         if command == "promote":
-            version = int(_arr(req, "version").reshape(-1)[0])
-            policy.promote(version)
-            return self._status({"ok": True, **policy.status()})
-        return self._status({"ok": False, "error": f"unknown command '{command}'"})
+            policy.promote(int(_scalar(req, "version")))
+            return self._respond({"ok": True, **policy.status()})
+
+        return self._respond({"ok": False, "error": f"unknown command '{command}'"})
 
     @staticmethod
-    def _status(d):
-        out = pb_utils.Tensor("status", np.array([json.dumps(d).encode()], dtype=np.object_))
-        return pb_utils.InferenceResponse(output_tensors=[out])
+    def _respond(status, action=None, index=None, logp=None, version=0):
+        n = 0 if action is None else action.shape[0]
+        return pb_utils.InferenceResponse(
+            output_tensors=[
+                pb_utils.Tensor("status", np.array([json.dumps(status).encode()], dtype=np.object_)),
+                pb_utils.Tensor("action", action if action is not None else np.zeros((0, 1), np.float32)),
+                pb_utils.Tensor("action_index", index if index is not None else np.zeros((n,), np.int64)),
+                pb_utils.Tensor("logp", logp if logp is not None else np.zeros((n,), np.float32)),
+                pb_utils.Tensor("policy_version", np.array([version], dtype=np.int64)),
+            ]
+        )

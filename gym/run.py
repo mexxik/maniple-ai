@@ -126,7 +126,6 @@ def main():
     print(
         f"policy '{args.name}' v{status['version']} ({status['updates']} updates so far), net: {status['net']}"
     )
-    agent.wait_until_ready()
 
     # per-environment bookkeeping the trainer needs to stitch trajectories
     agent_ids = np.arange(args.agents, dtype=np.int64)

@@ -7,7 +7,8 @@ services:
     # --log-verbose=1
     command: >
       tritonserver --model-repository=/models
-      --model-control-mode=poll --repository-poll-secs=1
+      --model-control-mode=explicit
+      --load-model=ppo_train --load-model=ppo_infer
     volumes:
       - ./model_repository:/models
       - ./checkpoints:/checkpoints   # trainer state, survives restarts
@@ -31,3 +32,16 @@ services:
               count: 1
               capabilities: [gpu]
     restart: unless-stopped
+
+  # One-off: delete every trained policy (exports, TensorRT engines, manifests) and every checkpoint.
+  #   docker compose run --rm reset && docker compose restart triton
+  # Runs in a container so root-owned leftovers are removed too. Never started by `up`.
+  reset:
+    image: alpine
+    profiles: [tools]
+    volumes:
+      - ./model_repository:/models
+      - ./checkpoints:/checkpoints
+    command: >
+      sh -c 'find /checkpoints -mindepth 1 ! -name .gitkeep -exec rm -rf {} + 2>/dev/null; rm -rf /models/policy_*;
+             echo "policies and checkpoints removed"; ls /models'

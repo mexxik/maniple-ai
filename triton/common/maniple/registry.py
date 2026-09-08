@@ -1,8 +1,9 @@
 """PolicyRegistry: named policies living inside an '<algo>_train' Triton model.
 
-Policy = spec + Algorithm instance + TransitionBuffer + a background thread that calls algorithm.update()
-whenever the buffer holds algorithm.rollout_size transitions, then exports '<name>_policy/<version>'
-and checkpoints. Algorithm-agnostic: pass the Algorithm class at construction.
+Policy = spec + Algorithm + TransitionBuffer + VersionTracker + a background training thread.
+- version number = update count; 'latest' is served from memory (act()), never from the repository
+- exports happen on events only: best training score improved (optional), command=export, promote
+- promote builds a TensorRT engine in the background (optional)
 """
 
 from __future__ import annotations
@@ -12,11 +13,12 @@ import os
 import threading
 import time
 
+import numpy as np
 import torch
 
 from .algorithms.base import Algorithm
 from .buffer import TransitionBuffer
-from .export import export_actor, latest_exported_version, policy_model_name
+from .export import build_trt, export_actor, latest_exported_version, policy_model_name, prune_versions
 from .spec import AgentSpec
 from .versions import VersionTracker
 
@@ -26,27 +28,58 @@ class Policy:
         self.name, self.spec, self.reg = name, spec, registry
         self.algo: Algorithm = registry.algorithm_cls(spec, registry.device)
         self.buffer = TransitionBuffer(spec.obs_dim, spec.action.out_dim)
+        self.model_dir = os.path.join(registry.model_repository, policy_model_name(name))
         self.versions = VersionTracker(
-            model_dir=os.path.join(registry.model_repository, policy_model_name(name)),
-            min_episodes=spec.versioning.min_episodes,
-            keep_latest=spec.versioning.keep_latest,
+            model_dir=self.model_dir,
+            score_window=spec.versioning.score_window,
+            keep_exported=spec.versioning.keep_exported,
         )
-        # exported version == Triton model version of '<name>_policy'; continue after whatever is already there
-        self.version = latest_exported_version(name, registry.model_repository)
+
+        self.version = max(1, self.versions.latest, latest_exported_version(name, registry.model_repository))
         self.updates = 0
         self.total_samples = 0
         self.last_stats = {}
+
+        self.weights_lock = threading.Lock()  # act() vs update()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, name=f"train-{name}", daemon=True)
 
+    # ------------------------------------------------------------------ lifecycle
+
     def start(self):
-        if self.version == 0:
-            self.export()  # version 1 = untrained, so '<name>_policy' exists immediately
+        self.versions.set_latest(self.version, save=True)
         if not self._thread.is_alive():
             self._thread.start()
 
     def stop(self):
         self._stop.set()
+
+    # ------------------------------------------------------------------ acting (channel 'latest')
+
+    @torch.no_grad()
+    def act(self, obs: np.ndarray, explore: bool):
+        """obs [N, obs_dim] -> (action, action_index, logp) with the current weights."""
+        actor = self.algo.actor()
+        with self.weights_lock:
+            actor.eval()
+            x = torch.as_tensor(obs, device=self.reg.device)
+            dist = actor.distribution(x)
+            if actor.continuous:
+                sample = dist.sample() if explore else dist.mean
+                logp = dist.log_prob(sample).sum(-1)
+                action = sample
+                index = torch.full((obs.shape[0],), -1, dtype=torch.int64, device=x.device)
+            else:
+                index = dist.sample() if explore else dist.probs.argmax(-1)
+                logp = dist.log_prob(index)
+                action = torch.nn.functional.one_hot(index, dist.probs.shape[-1]).float()
+        return (
+            action.cpu().numpy().astype(np.float32),
+            index.cpu().numpy().astype(np.int64),
+            logp.cpu().numpy().astype(np.float32),
+        )
+
+    # ------------------------------------------------------------------ data in
 
     def observe(self, obs, action, reward, done, agent_id, episode_id, policy_version, logp=None) -> int:
         if obs is None or action is None or reward is None or done is None:
@@ -64,63 +97,96 @@ class Policy:
             max_lag=self.spec.ppo.max_policy_lag,
         )
         self.total_samples += n
-        if agent_id is not None and episode_id is not None and policy_version is not None:
-            self.versions.observe_rows(agent_id, episode_id, reward, done, policy_version)
+        if agent_id is not None and episode_id is not None:
+            self.versions.observe_rows(agent_id, episode_id, reward, done)
         return n
+
+    # ------------------------------------------------------------------ training loop
 
     def _loop(self):
         while not self._stop.is_set():
-            if len(self.buffer) >= self.algo.rollout_size:
-                self.last_stats = self.algo.update(self.buffer.take())
-                self.updates += 1
-                self.versions.refresh()
-                if self.updates % self.reg.export_every_updates == 0:
-                    self.export()
-                self.checkpoint()
-            else:
+            if len(self.buffer) < self.algo.rollout_size:
                 time.sleep(0.05)
+                continue
+
+            trajectories = self.buffer.take()
+            with self.weights_lock:
+                self.last_stats = self.algo.update(trajectories)
+            self.updates += 1
+            self.version += 1
+            self.versions.set_latest(self.version)
+
+            if self.spec.versioning.export_on_improvement:
+                self._export_if_improved()
+            self.checkpoint()
+
+    def _export_if_improved(self):
+        current = self.versions.current_train_score()
+        best = self.versions.best_score()
+        if current is not None and (best is None or current > best):
+            self.export()
+
+    # ------------------------------------------------------------------ exports
 
     def export(self) -> int:
-        self.version += 1
+        """Write the current weights as 'policy_<name>/<version>'. Returns the version."""
+        version = self.version
         with self.reg.export_lock:
-            on_disk = (
-                [int(v) for v in os.listdir(self.versions.model_dir) if v.isdigit()]
-                if os.path.isdir(self.versions.model_dir)
-                else []
-            )
-            keep = self.versions.versions_to_keep(on_disk + [self.version])
-            export_actor(
-                self.algo.actor(), self.spec, self.name, self.version, self.reg.model_repository, keep=keep
-            )
-        self.algo.actor().to(self.reg.device)
-        self.versions.on_export(self.version)
-        return self.version
+            with self.weights_lock:
+                export_actor(self.algo.actor(), self.spec, self.name, version, self.reg.model_repository)
+            self.versions.on_export(version)
+            self._prune()
+        return version
+
+    def _prune(self):
+        keep = self.versions.exported_to_keep()
+        on_disk = {int(v) for v in os.listdir(self.model_dir) if v.isdigit()}
+        prune_versions(self.model_dir, keep)
+        self.versions.drop_exported(on_disk - keep)
 
     def report(self, version: int, score: float, episodes: int) -> None:
         self.versions.report(version, score, episodes)
 
     def promote(self, version: int) -> None:
+        if version == self.version and version not in self.versions.exported:
+            self.export()
+        if version not in self.versions.exported:
+            raise ValueError(f"version {version} is not exported (exported: {self.versions.exported})")
         self.versions.promote(version)
+        if self.spec.versioning.trt_on_promote:
+            threading.Thread(
+                target=self._build_trt, args=(version,), name=f"trt-{self.name}", daemon=True
+            ).start()
+
+    def _build_trt(self, version: int):
+        self.versions.set_trt(version, "building")
+        try:
+            build_trt(self.name, version, self.spec, self.reg.model_repository)
+            self.versions.set_trt(version, "ready")
+        except Exception as e:  # noqa: BLE001 - reported through the manifest, never fatal
+            self.versions.set_trt(version, "failed", f"{type(e).__name__}: {e}")
+
+    # ------------------------------------------------------------------ persistence
 
     def checkpoint(self):
         d = os.path.join(self.reg.checkpoint_dir, self.name)
         os.makedirs(d, exist_ok=True)
-        torch.save(
-            {
-                "algo": self.algo.state_dict(),
-                "version": self.version,
-                "updates": self.updates,
-                "total_samples": self.total_samples,
-            },
-            os.path.join(d, "state.pt"),
-        )
+        state = {
+            "algo": self.algo.state_dict(),
+            "version": self.version,
+            "updates": self.updates,
+            "total_samples": self.total_samples,
+        }
+        torch.save(state, os.path.join(d, "state.pt"))
         with open(os.path.join(d, "spec.json"), "w") as f:
             f.write(self.spec.to_json())
 
     def restore(self, d: str):
         st = torch.load(os.path.join(d, "state.pt"), map_location=self.reg.device)
         self.algo.load_state_dict(st["algo"])
-        self.version, self.updates, self.total_samples = st["version"], st["updates"], st["total_samples"]
+        self.version = max(self.version, int(st["version"]))
+        self.updates = int(st["updates"])
+        self.total_samples = int(st["total_samples"])
 
     def status(self) -> dict:
         return {
@@ -140,16 +206,10 @@ class Policy:
 
 class PolicyRegistry:
     def __init__(
-        self,
-        algorithm_cls: type[Algorithm],
-        model_repository: str,
-        checkpoint_dir: str,
-        export_every_updates: int,
-        device: str,
+        self, algorithm_cls: type[Algorithm], model_repository: str, checkpoint_dir: str, device: str
     ):
         self.algorithm_cls = algorithm_cls
         self.model_repository, self.checkpoint_dir = model_repository, checkpoint_dir
-        self.export_every_updates = max(1, export_every_updates)
         self.device = device if torch.cuda.is_available() else "cpu"
         self.export_lock = threading.Lock()
         self._policies: dict[str, Policy] = {}
@@ -165,7 +225,7 @@ class PolicyRegistry:
                 if p.spec.to_json() != spec.to_json():
                     raise ValueError(
                         f"policy '{name}' exists with a different spec; use another name, or delete "
-                        f"model_repository/{name}_policy and checkpoints/{name} to start over"
+                        f"model_repository/policy_{name} and checkpoints/{name} to start over"
                     )
                 return p
             p = Policy(name, spec, self)
@@ -174,9 +234,10 @@ class PolicyRegistry:
             return p
 
     def load_all(self):
+        """Restore checkpointed policies after a server restart."""
         if not os.path.isdir(self.checkpoint_dir):
             return
-        for name in os.listdir(self.checkpoint_dir):
+        for name in sorted(os.listdir(self.checkpoint_dir)):
             d = os.path.join(self.checkpoint_dir, name)
             if not os.path.exists(os.path.join(d, "spec.json")):
                 continue

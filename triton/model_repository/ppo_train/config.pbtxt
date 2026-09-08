@@ -1,31 +1,36 @@
-# ppo_train: the ALGORITHM. Owns named policies, collects transitions, trains in the background and
-# exports each named policy as a static Triton model "<name>_policy" (ONNX) that clients use for act().
+# ppo_train: the ALGORITHM. Owns named policies, serves the 'latest' channel from its current weights
+# (command=act), collects transitions (command=observe), trains in the background, and exports static
+# 'policy_<name>' models only on events (score improvement, command=export, promote).
 name: "ppo_train"
 backend: "python"
 max_batch_size: 0            # rows are the batch dim inside each tensor; shapes vary per policy
 
 input [
   { name: "name",           data_type: TYPE_STRING, dims: [ 1 ] },
-  { name: "command",        data_type: TYPE_STRING, dims: [ 1 ],  optional: true },   # register | observe | status | export | report | promote
+  { name: "command",        data_type: TYPE_STRING, dims: [ 1 ],  optional: true },   # register | act | observe | status | export | report | promote
   { name: "spec",           data_type: TYPE_STRING, dims: [ 1 ],  optional: true },   # JSON AgentSpec (register)
-  { name: "agent_id",       data_type: TYPE_INT64,  dims: [ -1 ], optional: true },
-  { name: "episode_id",     data_type: TYPE_INT64,  dims: [ -1 ], optional: true },
   { name: "obs",            data_type: TYPE_FP32,   dims: [ -1, -1 ], optional: true },
+  { name: "explore",        data_type: TYPE_BOOL,   dims: [ 1 ],  optional: true },   # act
   { name: "action",         data_type: TYPE_FP32,   dims: [ -1, -1 ], optional: true },
   { name: "reward",         data_type: TYPE_FP32,   dims: [ -1 ], optional: true },
   { name: "done",           data_type: TYPE_BOOL,   dims: [ -1 ], optional: true },
+  { name: "agent_id",       data_type: TYPE_INT64,  dims: [ -1 ], optional: true },
+  { name: "episode_id",     data_type: TYPE_INT64,  dims: [ -1 ], optional: true },
   { name: "policy_version", data_type: TYPE_INT64,  dims: [ -1 ], optional: true },
-  { name: "logp",           data_type: TYPE_FP32,   dims: [ -1 ], optional: true },  # behaviour log-prob from <algo>_infer
-  { name: "version",        data_type: TYPE_INT64,  dims: [ 1 ],  optional: true },  # report / promote
-  { name: "score",          data_type: TYPE_FP32,   dims: [ 1 ],  optional: true },  # report
-  { name: "episodes",       data_type: TYPE_INT64,  dims: [ 1 ],  optional: true }   # report
+  { name: "logp",           data_type: TYPE_FP32,   dims: [ -1 ], optional: true },   # behaviour log-prob
+  { name: "version",        data_type: TYPE_INT64,  dims: [ 1 ],  optional: true },   # report / promote
+  { name: "score",          data_type: TYPE_FP32,   dims: [ 1 ],  optional: true },   # report
+  { name: "episodes",       data_type: TYPE_INT64,  dims: [ 1 ],  optional: true }    # report
 ]
 output [
-  { name: "status", data_type: TYPE_STRING, dims: [ 1 ] }      # JSON: {ok, name, version, samples, updates, ...}
+  { name: "status",         data_type: TYPE_STRING, dims: [ 1 ] },       # JSON, always
+  { name: "action",         data_type: TYPE_FP32,   dims: [ -1, -1 ] },  # act
+  { name: "action_index",   data_type: TYPE_INT64,  dims: [ -1 ] },      # act
+  { name: "logp",           data_type: TYPE_FP32,   dims: [ -1 ] },      # act
+  { name: "policy_version", data_type: TYPE_INT64,  dims: [ 1 ] }        # act
 ]
 
 instance_group [ { count: 1, kind: KIND_GPU } ]
 
 parameters { key: "model_repository" value: { string_value: "/models" } }
 parameters { key: "checkpoint_dir"   value: { string_value: "/checkpoints" } }
-parameters { key: "export_every_updates" value: { string_value: "1" } }

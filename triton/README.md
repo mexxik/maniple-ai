@@ -5,20 +5,23 @@
     curl -s -X POST localhost:8000/v2/repository/index
     docker compose logs -f triton
     docker compose down
+    docker compose run --rm reset && docker compose restart triton   # wipe all policies + checkpoints
 
 ## Models
 | model | what |
 |---|---|
-| `ppo_train` | the algorithm (Python backend, `common/maniple`). `register` a named policy with an `AgentSpec`, `observe` transitions; trains in the background, exports every update |
-| `ppo_infer` | inference entry point: `name` + `obs` (+ `explore`) → `action`, `action_index`, `logp`, `policy_version`. BLS to `<name>_policy` |
-| `<name>_policy` | static ONNX exported by the trainer (`obs` → `action` [, `log_std`], `policy_version`). Hot path if you want to skip `ppo_infer` |
+| `ppo_train` | the algorithm (Python backend, `common/maniple`). `register` a named policy with an `AgentSpec`, `observe` transitions, `act` = the `latest` channel from the current weights; trains in the background; exports on events (`export`, `promote`, score improvement) |
+| `ppo_infer` | inference entry point: `name` + `obs` (+ `explore`, `channel`) → `action`, `action_index`, `logp`, `policy_version`. `latest` → `ppo_train`; `best`/`stable`/`<n>` → exported models, loaded on first use, unloaded when idle |
+| `policy_<name>` | ONNX exports of a policy (several versions), manifest `versions.json` next to it |
+| `policy_<name>_trt` | TensorRT engine built on `promote` for the `stable` version |
 
+The server runs in explicit model-control mode: only `ppo_train` and `ppo_infer` load at start.
 Protocol details: docstrings in `common/maniple/triton_model.py` and `common/maniple/infer_model.py`.
 A new algorithm = `common/maniple/algorithms/<x>.py` + `model_repository/<x>_train/1/model.py` (subclass, 5 lines).
 
 ## Gotchas
 - `common/` is mounted at `/common`; Triton only reloads a model when files under its own directory change, so after
   editing `common/` run `docker compose restart triton`.
-- The repository is polled every 1 s; the trainer writes `<name>_policy/<version>` atomically and keeps the last 3.
+- Explicit model control: nothing is polled; `ppo_infer` loads exported models on demand.
 - The container runs as your uid (`user:` in compose) so exported models and checkpoints stay deletable.
 - Model artifacts (`*.onnx`, checkpoints) are gitignored.

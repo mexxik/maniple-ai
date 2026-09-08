@@ -36,12 +36,15 @@ def parse_args():
     parser.add_argument("--fps", type=int, default=50, help="playback / video frame rate")
     parser.add_argument("--explore", action="store_true", help="sample actions instead of greedy")
     parser.add_argument("--max-steps", type=int, default=1000, help="safety cap per episode")
-    parser.add_argument("--channel", default="best", help="best | latest | stable | <version number>")
+    parser.add_argument("--channel", default="stable", help="stable | best | latest | <version number>")
     parser.add_argument(
         "--report", action="store_true", help="send the mean return to the trainer as an eval score"
     )
     parser.add_argument(
         "--promote", action="store_true", help="after playing, pin 'stable' to the version played"
+    )
+    parser.add_argument(
+        "--export", action="store_true", help="before playing, export the trainer's current version"
     )
     return parser.parse_args()
 
@@ -81,6 +84,10 @@ def main():
 
     env = gym.make(args.env, render_mode=RENDER_MODES[render])
     agent = TritonAgent(args.url, args.name)
+
+    if args.export:
+        status = agent.export()
+        print(f"exported v{status['exported_version']}")
 
     frames = []
     returns = []
