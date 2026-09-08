@@ -54,6 +54,9 @@ class NetConfig:
     layernorm: bool = False  # LayerNorm after every hidden layer
     separate_critic: bool = True  # False = critic head on the actor torso
     normalize_obs: bool = True  # running mean/std of observations, baked into the export
+    log_std_init: float = (
+        0.0  # continuous actions: initial log std of the Gaussian (0 = std 1; -1 = std 0.37)
+    )
 
     def resolve_hidden(self, obs_dim: int) -> list[int]:
         """The hidden layer sizes this config means for a given observation size."""
@@ -149,4 +152,5 @@ class AgentSpec:
             "layernorm": self.net.layernorm,
             "separate_critic": self.net.separate_critic,
             "normalize_obs": self.net.normalize_obs,
+            "log_std_init": self.net.log_std_init,
         }

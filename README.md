@@ -13,9 +13,10 @@ scripts/gen_triton_protos.sh                          # Triton stubs (already co
 cd triton && docker compose up -d                     # model server on :8000 (HTTP) / :8001 (gRPC)
 ```
 
-Then add `ue/Plugins/ManipleInference` (core: `FManipleTritonClient`, `FManipleBatchInferer`) to your project's
-`Plugins/` and enable it. `ue/Plugins/ManipleLyra` is the reference integration for the Lyra Starter Game
-(`-ManipleBrain=triton` and friends, see the plugin header comments).
+Then add `ue/Plugins/ManipleInference` (core: `FManipleTritonClient` streaming gRPC client, `FManipleAgentClient`
+train/act/observe protocol) to your project's `Plugins/` and enable it. `ue/Plugins/ManipleLyra` is the reference
+integration for the Lyra Starter Game: bots trained and served from Triton, all driven by launch arguments.
+See [ue/README.md](ue/README.md).
 
 Model artifacts (`*.onnx`, TensorRT plans) are not in git: fill `triton/model_repository/<model>/<version>/` yourself.
 

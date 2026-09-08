@@ -26,6 +26,64 @@ FManipleTensor FManipleTensor::MakeFloat(const FString& InName, TConstArrayView<
 	return T;
 }
 
+FManipleTensor FManipleTensor::MakeInt64(const FString& InName, TConstArrayView<int64> InShape, TConstArrayView<int64> Values)
+{
+	FManipleTensor T;
+	T.Name = InName;
+	T.Shape = TArray<int64>(InShape.GetData(), InShape.Num());
+	T.Datatype = TEXT("INT64");
+	T.Data.SetNumUninitialized(Values.Num() * sizeof(int64));
+	FMemory::Memcpy(T.Data.GetData(), Values.GetData(), T.Data.Num());
+	return T;
+}
+
+FManipleTensor FManipleTensor::MakeBool(const FString& InName, TConstArrayView<int64> InShape, TConstArrayView<bool> Values)
+{
+	FManipleTensor T;
+	T.Name = InName;
+	T.Shape = TArray<int64>(InShape.GetData(), InShape.Num());
+	T.Datatype = TEXT("BOOL");
+	T.Data.SetNumUninitialized(Values.Num());
+	for (int32 i = 0; i < Values.Num(); ++i)
+		T.Data[i] = Values[i] ? 1 : 0;
+	return T;
+}
+
+FManipleTensor FManipleTensor::MakeStrings(const FString& InName, TConstArrayView<FString> Strings)
+{
+	FManipleTensor T;
+	T.Name = InName;
+	T.Shape = {Strings.Num()};
+	T.Datatype = TEXT("BYTES");
+	for (const FString& S : Strings)
+	{
+		const FTCHARToUTF8 Utf8(*S);
+		const uint32 Len = (uint32)Utf8.Length();
+		T.Data.Append(reinterpret_cast<const uint8*>(&Len), sizeof(Len));
+		T.Data.Append(reinterpret_cast<const uint8*>(Utf8.Get()), Len);
+	}
+	return T;
+}
+
+TArray<FString> FManipleTensor::AsStrings() const
+{
+	TArray<FString> Out;
+	if (Datatype != TEXT("BYTES"))
+		return Out;
+	int32 Pos = 0;
+	while (Pos + 4 <= Data.Num())
+	{
+		uint32 Len = 0;
+		FMemory::Memcpy(&Len, Data.GetData() + Pos, 4);
+		Pos += 4;
+		if (Pos + (int32)Len > Data.Num())
+			break;
+		Out.Add(FString(FUTF8ToTCHAR(reinterpret_cast<const ANSICHAR*>(Data.GetData() + Pos), Len)));
+		Pos += Len;
+	}
+	return Out;
+}
+
 int64 FManipleTensor::NumElements() const
 {
 	int64 N = 1;

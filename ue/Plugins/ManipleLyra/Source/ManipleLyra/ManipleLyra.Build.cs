@@ -8,9 +8,9 @@ public class ManipleLyra : ModuleRules
 
 		PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine" });
 		PrivateDependencyModuleNames.AddRange(new string[] {
-			"AIModule", "GameplayAbilities", "GameplayTags", "GameplayTasks",
-			"ModularGameplay", "ModularGameplayActors",
-			"LyraGame",
+			"AIModule", "NavigationSystem", "GameplayAbilities", "GameplayTags", "GameplayTasks",
+			"ModularGameplay", "ModularGameplayActors", "GameplayMessageRuntime",
+			"LyraGame", "Json",
 			"ManipleInference"
 		});
 	}

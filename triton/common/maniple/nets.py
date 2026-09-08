@@ -73,7 +73,7 @@ class Actor(nn.Module):
         self.net = mlp(spec.obs_dim, spec.hidden, spec.action.out_dim, net.activation, net.layernorm)
         self.continuous = spec.action.type == "continuous"
         if self.continuous:
-            self.log_std = nn.Parameter(torch.zeros(spec.action.out_dim))
+            self.log_std = nn.Parameter(torch.full((spec.action.out_dim,), float(spec.net.log_std_init)))
 
     def forward(self, obs):
         """Export signature. Continuous: (mean, log_std broadcast to [batch, dim]); discrete: logits."""

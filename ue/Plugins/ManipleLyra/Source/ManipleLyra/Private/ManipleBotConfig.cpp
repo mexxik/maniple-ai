@@ -6,37 +6,124 @@ FManipleBotConfig FManipleBotConfig::FromCommandLine()
 {
 	FManipleBotConfig C;
 	const TCHAR* Cmd = FCommandLine::Get();
+
+	// ---- brain / mode ----
 	FString Brain;
 	if (FParse::Value(Cmd, TEXT("ManipleBrain="), Brain))
 	{
 		if (Brain.Equals(TEXT("random"), ESearchCase::IgnoreCase))
 			C.Brain = EManipleBrain::Random;
+		else if (Brain.Equals(TEXT("heuristic"), ESearchCase::IgnoreCase))
+			C.Brain = EManipleBrain::Heuristic;
 		else if (Brain.Equals(TEXT("triton"), ESearchCase::IgnoreCase))
 			C.Brain = EManipleBrain::Triton;
 		else
 			C.Brain = EManipleBrain::None;
 	}
+	FString Mode;
+	if (FParse::Value(Cmd, TEXT("ManipleMode="), Mode) && Mode.Equals(TEXT("train"), ESearchCase::IgnoreCase))
+		C.Mode = EManipleMode::Train;
+
 	FParse::Value(Cmd, TEXT("ManipleModel="), C.Model);
 	FParse::Value(Cmd, TEXT("ManipleTritonUrl="), C.TritonUrl);
+
+	// ---- channel / exploration ----
+	FParse::Value(Cmd, TEXT("ManipleChannel="), C.Channel);
+	C.bExplore = C.Mode == EManipleMode::Train;
+	int32 Explore = 0;
+	if (FParse::Value(Cmd, TEXT("ManipleExplore="), Explore))
+		C.bExplore = Explore != 0;
+	if (C.Mode == EManipleMode::Train)
+		C.Channel = TEXT("latest");
+
+	// ---- bots ----
 	FString Bots;
 	if (FParse::Value(Cmd, TEXT("ManipleBots="), Bots) && !Bots.Equals(TEXT("all"), ESearchCase::IgnoreCase))
-	{
 		C.MaxBots = FCString::Atoi(*Bots);
-	}
+	C.DecisionHz = C.Mode == EManipleMode::Train ? 15.f : 10.f;
 	FParse::Value(Cmd, TEXT("ManipleHz="), C.DecisionHz);
 	C.DecisionHz = FMath::Clamp(C.DecisionHz, 1.f, 60.f);
-	int32 Batch = 1;
-	if (FParse::Value(Cmd, TEXT("ManipleBatch="), Batch))
-		C.bBatch = Batch != 0;
 	FParse::Value(Cmd, TEXT("ManipleSpawnBots="), C.SpawnBots);
+
+	// ---- network ----
+	FParse::Value(Cmd, TEXT("ManipleNet="), C.NetPreset);
+	FString Hidden;
+	if (FParse::Value(Cmd, TEXT("ManipleHidden="), Hidden))
+	{
+		TArray<FString> Parts;
+		Hidden.ParseIntoArray(Parts, TEXT(","));
+		for (const FString& P : Parts)
+			C.Hidden.Add(FCString::Atoi(*P));
+	}
+	FParse::Value(Cmd, TEXT("ManipleActivation="), C.Activation);
+	int32 LayerNorm = 0;
+	if (FParse::Value(Cmd, TEXT("ManipleLayerNorm="), LayerNorm))
+		C.bLayerNorm = LayerNorm != 0;
+	FParse::Value(Cmd, TEXT("ManipleEntropy="), C.EntropyCoef);
+	FParse::Value(Cmd, TEXT("ManipleLogStd="), C.LogStdInit);
+
+	// ---- training helpers ----
+	FParse::Value(Cmd, TEXT("ManipleTimeScale="), C.TimeScale);
+	C.TimeScale = FMath::Clamp(C.TimeScale, 0.1f, 50.f);
+	C.bSpectate = FParse::Param(Cmd, TEXT("ManipleSpectate"));
+
+	// ---- curriculum ----
+	FString Curriculum = C.Mode == EManipleMode::Train ? TEXT("auto") : TEXT("off");
+	FParse::Value(Cmd, TEXT("ManipleCurriculum="), Curriculum);
+	if (Curriculum.Equals(TEXT("auto"), ESearchCase::IgnoreCase))
+	{
+		C.CurriculumStage = 0;
+		C.bCurriculumAuto = true;
+	}
+	else if (Curriculum.IsNumeric())
+	{
+		C.CurriculumStage = FCString::Atoi(*Curriculum);
+	}
+	C.bEndless = C.Mode == EManipleMode::Train;
+	int32 Endless = 0;
+	if (FParse::Value(Cmd, TEXT("ManipleEndless="), Endless))
+		C.bEndless = Endless != 0;
+	C.bSyncAct = C.Mode == EManipleMode::Train;
+	int32 Sync = 0;
+	if (FParse::Value(Cmd, TEXT("ManipleSync="), Sync))
+		C.bSyncAct = Sync != 0;
+	FString Opp;
+	if (FParse::Value(Cmd, TEXT("ManipleOpponents="), Opp))
+	{
+		if (Opp.Equals(TEXT("self"), ESearchCase::IgnoreCase))
+			C.Opponents = EManipleOpponents::Self;
+		else if (Opp.Equals(TEXT("mixed"), ESearchCase::IgnoreCase))
+			C.Opponents = EManipleOpponents::Mixed;
+		else if (Opp.Equals(TEXT("heuristic"), ESearchCase::IgnoreCase))
+			C.Opponents = EManipleOpponents::Heuristic;
+	}
+
 	return C;
 }
 
 FString FManipleBotConfig::ToString() const
 {
 	const TCHAR* BrainStr = Brain == EManipleBrain::Random ? TEXT("random")
+		: Brain == EManipleBrain::Heuristic				   ? TEXT("heuristic")
 		: Brain == EManipleBrain::Triton				   ? TEXT("triton")
 														   : TEXT("none");
-	return FString::Printf(TEXT("brain=%s model=%s url=%s bots=%s hz=%.0f batch=%d spawn=%d"), BrainStr, *Model, *TritonUrl,
-		MaxBots < 0 ? TEXT("all") : *FString::FromInt(MaxBots), DecisionHz, bBatch ? 1 : 0, SpawnBots);
+	const TCHAR* ModeStr = Mode == EManipleMode::Train ? TEXT("train") : TEXT("infer");
+
+	FString HiddenStr;
+	for (int32 W : Hidden)
+		HiddenStr += (HiddenStr.IsEmpty() ? TEXT("") : TEXT(",")) + FString::FromInt(W);
+
+	const TCHAR* OppStr = Opponents == EManipleOpponents::Self ? TEXT("self")
+		: Opponents == EManipleOpponents::Mixed				   ? TEXT("mixed")
+		: Opponents == EManipleOpponents::Heuristic			   ? TEXT("heuristic")
+															   : TEXT("stage");
+	const FString CurriculumStr = CurriculumStage < 0 ? TEXT("off") : bCurriculumAuto ? TEXT("auto") : FString::FromInt(CurriculumStage);
+
+	return FString::Printf(
+		TEXT(
+			"brain=%s mode=%s model=%s url=%s channel=%s explore=%d bots=%s hz=%.0f spawn=%d net=%s hidden=[%s] "
+			"activation=%s layernorm=%d entropy=%.3f logstd=%.2f timescale=%.1f spectate=%d curriculum=%s opponents=%s endless=%d sync=%d"),
+		BrainStr, ModeStr, *Model, *TritonUrl, *Channel, bExplore ? 1 : 0, MaxBots < 0 ? TEXT("all") : *FString::FromInt(MaxBots),
+		DecisionHz, SpawnBots, *NetPreset, *HiddenStr, *Activation, bLayerNorm ? 1 : 0, EntropyCoef, LogStdInit, TimeScale,
+		bSpectate ? 1 : 0, *CurriculumStr, OppStr, bEndless ? 1 : 0, bSyncAct ? 1 : 0);
 }

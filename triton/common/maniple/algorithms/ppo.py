@@ -53,10 +53,13 @@ class PPO(Algorithm):
         self.optimizer.load_state_dict(state["optimizer"])
 
     def update(self, trajectories):
+        # optimise under the normaliser the actions were sampled with (the sent log-probs assume it),
+        # then let the running statistics absorb this batch for the next version
+        batch = self._prepare_batch(trajectories)
+        stats = self._optimize(batch)
         all_obs = torch.as_tensor(np.concatenate([t["obs"] for t in trajectories]), device=self.device)
         self.model.actor.normalizer.update(all_obs)
-        batch = self._prepare_batch(trajectories)
-        return self._optimize(batch)
+        return stats
 
     # ------------------------------------------------------------------ internals
 
@@ -148,4 +151,6 @@ class PPO(Algorithm):
 
         for key in ("loss_pi", "loss_v", "kl"):
             stats[key] /= max(steps, 1)
+        if hasattr(self.model.actor, "log_std"):
+            stats["std"] = float(self.model.actor.log_std.exp().mean())
         return stats
