@@ -6,6 +6,8 @@
 #include "Teams/LyraTeamSubsystem.h"
 #include "Physics/LyraCollisionChannels.h"
 #include "AbilitySystem/LyraAbilitySystemComponent.h"
+#include "AbilitySystem/Abilities/LyraGameplayAbility.h"
+#include "AbilitySystem/Attributes/LyraHealthSet.h"
 #include "AIController.h"
 #include "BrainComponent.h"
 #include "EngineUtils.h"
@@ -73,10 +75,7 @@ void UManipleAgentComponent::OnDeathStarted(AActor* OwningActor)
 	if (bFiring)
 	{
 		if (ULyraAbilitySystemComponent* ASC = Character.IsValid() ? Character->GetLyraAbilitySystemComponent() : nullptr)
-		{
-			static const FGameplayTag FireTag = FGameplayTag::RequestGameplayTag(TEXT("InputTag.Weapon.Fire"));
-			ASC->AbilityInputTagReleased(FireTag);
-		}
+			SetFireInput(*ASC, false);
 		bFiring = false;
 	}
 }
@@ -100,6 +99,31 @@ bool UManipleAgentComponent::IsReady() const
 		return false;
 	const ULyraHealthComponent* H = ULyraHealthComponent::FindHealthComponent(Character.Get());
 	return H && !H->IsDeadOrDying();
+}
+
+void UManipleAgentComponent::SetFireInput(ULyraAbilitySystemComponent& ASC, bool bPressed)
+{
+	// the pistol's fire ability listens to InputTag.Weapon.Fire, the rifle and shotgun from the map's weapon spawners to
+	// InputTag.Weapon.FireAuto; a bot picks those up by walking over them, so press both
+	static const FGameplayTag FireTag = FGameplayTag::RequestGameplayTag(TEXT("InputTag.Weapon.Fire"));
+	static const FGameplayTag FireAutoTag = FGameplayTag::RequestGameplayTag(TEXT("InputTag.Weapon.FireAuto"));
+	if (bPressed)
+	{
+		ASC.AbilityInputTagPressed(FireTag);
+		ASC.AbilityInputTagPressed(FireAutoTag);
+	}
+	else
+	{
+		ASC.AbilityInputTagReleased(FireTag);
+		ASC.AbilityInputTagReleased(FireAutoTag);
+	}
+	bFiring = bPressed;
+}
+
+bool UManipleAgentComponent::HasDamageImmunity() const
+{
+	const ULyraAbilitySystemComponent* ASC = Character.IsValid() ? Character->GetLyraAbilitySystemComponent() : nullptr;
+	return ASC && ASC->HasMatchingGameplayTag(TAG_Gameplay_DamageImmunity);
 }
 
 // ---------- identity ----------
@@ -300,7 +324,8 @@ void UManipleAgentComponent::UpdateWeapon(float DeltaTime)
 	}
 	UObject* Item = GetActiveWeaponItem();
 	const int32 Magazine = GetMagazineAmmo(Item);
-	if (Magazine >= 0 && LastMagazine > Magazine)
+	const bool bShotThisFrame = Magazine >= 0 && LastMagazine > Magazine;
+	if (bShotThisFrame)
 	{
 		// a shot actually left the gun this frame: that is what the on-target bonus is for
 		++Shots;
@@ -329,6 +354,74 @@ void UManipleAgentComponent::UpdateWeapon(float DeltaTime)
 		bMagazineEmpty = false;
 	}
 
+	// dry-gun watchdog: a policy that wants to fire but never gets a round out is learning nothing. Out of spare ammo
+	// before the episode ends is the normal budget (refilled at the next episode); anything else (spare left but no
+	// reload, no weapon item, dry for longer than an episode) is a stuck gun: force refill + reload once and say why,
+	// then keep logging every 30 s so the log explains a silent run.
+	const bool bWantsFire = bHasAction && Action[ActFire] > 0.f;
+	if (bWantsFire && Magazine <= 0)
+	{
+		DrySeconds += DeltaTime;
+		DryLogTimer += DeltaTime;
+		const bool bCanReload = !Item || GetStat(Item, TEXT("Lyra.ShooterGame.Weapon.SpareAmmo")) > 0;
+		StuckSeconds = bCanReload ? StuckSeconds + DeltaTime : 0.f;
+		const bool bStuck = StuckSeconds > 10.f || DrySeconds > EpisodeTimeLimitSec + 10.f;
+		if (bStuck && !bDryHealed)
+		{
+			bDryHealed = true;
+			DryLogTimer = 0.f;
+			LogDryState(TEXT("dry for 10 s, forcing refill + reload"));
+			RefillAmmo();
+			ASC->AbilityInputTagPressed(ReloadTag);
+			bReloading = true;
+			ReloadRetryTimer = 3.f;
+		}
+		else if (bDryHealed && DryLogTimer > 30.f)
+		{
+			DryLogTimer = 0.f;
+			LogDryState(TEXT("still dry"));
+		}
+	}
+	else if (Magazine > 0)
+	{
+		if (bDryHealed)
+			UE_LOG(LogManipleLyra, Display, TEXT("agent %d: gun back after %.0f s dry"), AgentId, DrySeconds);
+		DrySeconds = 0.f;
+		StuckSeconds = 0.f;
+		DryLogTimer = 0.f;
+		bDryHealed = false;
+	}
+
+	// jammed-gun watchdog: rounds in the magazine, fire wanted, nothing leaves the gun. Seen after ~2 h of play: the fire
+	// ability stays blocked (a reload that never ends?). Cancel the input-activated abilities once, log the ability state.
+	if (bWantsFire && Magazine > 0 && !bShotThisFrame)
+	{
+		JamSeconds += DeltaTime;
+		JamLogTimer += DeltaTime;
+		if (JamSeconds > 10.f && !bJamHealed)
+		{
+			bJamHealed = true;
+			JamLogTimer = 0.f;
+			LogDryState(TEXT("jammed: ammo but no shot for 10 s, cancelling input abilities"));
+			ASC->CancelInputActivatedAbilities(false);
+			if (bFiring)
+				SetFireInput(*ASC, false); // ApplyAction presses again next frame
+		}
+		else if (bJamHealed && JamLogTimer > 30.f)
+		{
+			JamLogTimer = 0.f;
+			LogDryState(TEXT("still jammed"));
+		}
+	}
+	if (bShotThisFrame)
+	{
+		if (bJamHealed)
+			UE_LOG(LogManipleLyra, Display, TEXT("agent %d: gun back after %.0f s jammed"), AgentId, JamSeconds);
+		JamSeconds = 0.f;
+		JamLogTimer = 0.f;
+		bJamHealed = false;
+	}
+
 	DebugTimer += DeltaTime;
 	if (DebugTimer > 3.f)
 	{
@@ -344,6 +437,49 @@ void UManipleAgentComponent::UpdateWeapon(float DeltaTime)
 			*Character->GetPendingMovementInputVector().ToCompactString(), Action[ActMoveFwd], Action[ActMoveRight],
 			*Tags.ToStringSimple());
 	}
+}
+
+void UManipleAgentComponent::LogDryState(const TCHAR* Why) const
+{
+	UObject* Item = GetActiveWeaponItem();
+	int32 Slot = -1;
+	static UClass* QuickBarClass = FindObject<UClass>(nullptr, TEXT("/Script/LyraGame.LyraQuickBarComponent"));
+	UActorComponent* QuickBar = (AI.IsValid() && QuickBarClass) ? AI->GetComponentByClass(QuickBarClass) : nullptr;
+	if (UFunction* Fn = QuickBar ? QuickBar->FindFunction(TEXT("GetActiveSlotIndex")) : nullptr)
+	{
+		struct
+		{
+			int32 ReturnValue = -1;
+		} Params;
+		QuickBar->ProcessEvent(Fn, &Params);
+		Slot = Params.ReturnValue;
+	}
+	FGameplayTagContainer Tags;
+	FString Abilities;
+	const ULyraAbilitySystemComponent* ASC = Character.IsValid() ? Character->GetLyraAbilitySystemComponent() : nullptr;
+	if (ASC)
+	{
+		ASC->GetOwnedGameplayTags(Tags);
+		static const FGameplayTag FireTag = FGameplayTag::RequestGameplayTag(TEXT("InputTag.Weapon.Fire"));
+		static const FGameplayTag FireAutoTag = FGameplayTag::RequestGameplayTag(TEXT("InputTag.Weapon.FireAuto"));
+		static const FGameplayTag ReloadTag = FGameplayTag::RequestGameplayTag(TEXT("InputTag.Weapon.Reload"));
+		for (const FGameplayAbilitySpec& Spec : ASC->GetActivatableAbilities())
+		{
+			const FGameplayTagContainer& Src = Spec.GetDynamicSpecSourceTags();
+			if (!Src.HasTagExact(FireTag) && !Src.HasTagExact(FireAutoTag) && !Src.HasTagExact(ReloadTag))
+				continue;
+			Abilities += FString::Printf(TEXT("%s%s:%s%s"), Abilities.IsEmpty() ? TEXT("") : TEXT(","), *GetNameSafe(Spec.Ability),
+				Spec.IsActive() ? TEXT("active") : TEXT("idle"), Spec.InputPressed ? TEXT("+pressed") : TEXT(""));
+		}
+		Abilities += FString::Printf(TEXT(" blocked=%d/%d"),
+			ASC->IsActivationGroupBlocked(ELyraAbilityActivationGroup::Exclusive_Replaceable) ? 1 : 0,
+			ASC->IsActivationGroupBlocked(ELyraAbilityActivationGroup::Exclusive_Blocking) ? 1 : 0);
+	}
+	UE_LOG(LogManipleLyra, Display,
+		TEXT("agent %d dry (%s): item=%s slot=%d magazine=%d spare=%d firing=%d reloading=%d empty=%d shots=%d episode_t=%.0f tags=%s "
+			 "abilities=[%s]"),
+		AgentId, Why, *GetNameSafe(Item), Slot, GetMagazineAmmo(Item), GetStat(Item, TEXT("Lyra.ShooterGame.Weapon.SpareAmmo")),
+		bFiring ? 1 : 0, bReloading ? 1 : 0, bMagazineEmpty ? 1 : 0, Shots, EpisodeTime, *Tags.ToStringSimple(), *Abilities);
 }
 
 void UManipleAgentComponent::LogWeaponState() const
@@ -452,12 +588,10 @@ void UManipleAgentComponent::ApplyAction(float DeltaTime)
 
 	if (ULyraAbilitySystemComponent* ASC = Me->GetLyraAbilitySystemComponent())
 	{
-		static const FGameplayTag FireTag = FGameplayTag::RequestGameplayTag(TEXT("InputTag.Weapon.Fire"));
 		const bool bWantFire = Action[ActFire] > 0.f && !bMagazineEmpty;
 		if (bWantFire != bFiring)
 		{
-			bWantFire ? ASC->AbilityInputTagPressed(FireTag) : ASC->AbilityInputTagReleased(FireTag);
-			bFiring = bWantFire;
+			SetFireInput(*ASC, bWantFire);
 			if (bWantFire)
 				UE_LOG(LogManipleLyra, VeryVerbose, TEXT("agent %d fire: nearest=%.0f visible=%d yaw_err=%.1f pitch_err=%.1f vel=%.0f"),
 					AgentId, LastNearestDist, bLastVisible ? 1 : 0, LastYawErr, LastPitchErr, Character->GetVelocity().Size());

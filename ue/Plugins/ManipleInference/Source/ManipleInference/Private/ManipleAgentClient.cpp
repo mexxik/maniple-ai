@@ -48,6 +48,13 @@ FString FManipleAgentSpec::ToJson() const
 	Net->SetNumberField(TEXT("log_std_init"), LogStdInit);
 	Root->SetObjectField(TEXT("net"), Net);
 
+	if (!ScoreSource.IsEmpty())
+	{
+		TSharedRef<FJsonObject> V = MakeShared<FJsonObject>();
+		V->SetStringField(TEXT("score"), ScoreSource);
+		Root->SetObjectField(TEXT("versioning"), V);
+	}
+
 	if (Ppo.Num() > 0)
 	{
 		TSharedRef<FJsonObject> P = MakeShared<FJsonObject>();

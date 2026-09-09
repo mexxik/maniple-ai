@@ -21,7 +21,20 @@ enum class EManipleOpponents : uint8
 	Stage, // whatever the curriculum stage says (default)
 	Self, // every bot runs the policy (self-play)
 	Mixed, // every second bot runs the heuristic brain
-	Heuristic // one whole team runs the heuristic brain
+	Heuristic, // one whole team runs the heuristic brain
+	Lyra // one whole team keeps Lyra's behaviour trees (untouched bots): the benchmark opponent
+};
+
+/**
+ * What "score" means for this game mode. The subsystem turns it into one number per game-minute, reports it to the
+ * trainer (train mode, so 'best' ranks by it) and prints it at the end of an evaluation (-ManipleEval).
+ * Only bots in the final curriculum stage / Lyra spawns count, so the number always means "in the real game".
+ */
+enum class EManipleScoreKind : uint8
+{
+	Kills, // policy kills per agent-minute (from Lyra.Elimination.Message; deathmatch, elimination)
+	Stat, // per-player stat tag on the player state, summed over policy bots, per agent-minute (e.g. ShooterGame.Score.ControlPointCapture)
+	Team // team tag stack: our team minus the best other team, per game-minute (e.g. ShooterGame.ControlPoint.TeamScore)
 };
 
 /**
@@ -32,10 +45,14 @@ enum class EManipleOpponents : uint8
  *   -ManipleNet=auto|small|medium|large  -ManipleHidden=256,256        -ManipleActivation=tanh|relu|elu|gelu
  *   -ManipleLayerNorm=0|1                -ManipleEntropy=0.01          -ManipleLogStd=-1.0
  *   -ManipleTimeScale=1.0                -ManipleSpectate
- *   -ManipleCurriculum=auto|off|N        -ManipleOpponents=stage|self|mixed|heuristic
+ *   -ManipleCurriculum=auto|off|N        -ManipleOpponents=stage|self|mixed|heuristic|lyra
  *   -ManipleEndless=0|1                  no score / time limit, the match never restarts (default 1 in train mode)
  *   -ManipleSync=0|1                     block the game thread until the policy answers, so every action lasts exactly one
  *                                        decision period regardless of wall-clock speed (default 1 in train mode)
+ *   -ManipleScore=kills|stat:<Tag>|team:<Tag>   what counts as score in this game mode (see EManipleScoreKind)
+ *   -ManipleEval=N                       evaluation: once the bots can take damage, run N game-seconds, print one
+ *                                        "eval:" line with the score and quit (any brain / mode)
+ *   -ManipleEvalReport=0|1               also send the evaluation score to the trainer for the served version (default 0)
  */
 struct MANIPLELYRA_API FManipleBotConfig
 {
@@ -67,6 +84,15 @@ struct MANIPLELYRA_API FManipleBotConfig
 	EManipleOpponents Opponents = EManipleOpponents::Stage;
 	bool bEndless = false;
 	bool bSyncAct = false; // wait for the act reply inside the tick (deterministic timing; train default 1)
+
+	// score and evaluation
+	EManipleScoreKind ScoreKind = EManipleScoreKind::Kills;
+	FString ScoreTag; // stat / team tag name
+	float EvalSeconds = 0.f; // > 0: evaluation run of this many game-seconds after the warmup
+	bool bEvalReport = false;
+
+	FString ScoreToString() const;
+	const TCHAR* OpponentsToString() const;
 
 	static FManipleBotConfig FromCommandLine();
 	FString ToString() const;

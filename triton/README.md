@@ -12,7 +12,7 @@
 |---|---|
 | `ppo_train` | the algorithm (Python backend, `common/maniple`). `register` a named policy with an `AgentSpec`, `observe` transitions, `act` = the `latest` channel from the current weights; trains in the background; exports on events (`export`, `promote`, score improvement) |
 | `ppo_infer` | inference entry point: `name` + `obs` (+ `explore`, `channel`) → `action`, `action_index`, `logp`, `policy_version`. `latest` → `ppo_train`; `best`/`stable`/`<n>` → exported models, loaded on first use, unloaded when idle |
-| `policy_<name>` | ONNX exports of a policy (several versions), manifest `versions.json` next to it |
+| `policy_<name>` | ONNX exports of a policy (several versions), manifest `versions.json` next to it. `best` is ranked by the mean training return, or by the client's `report` scores when the spec says `versioning.score = "report"` (a game-defined number such as kills per agent-minute) |
 | `policy_<name>_trt` | TensorRT engine built on `promote` for the `stable` version |
 
 The server runs in explicit model-control mode: only `ppo_train` and `ppo_infer` load at start.

@@ -37,6 +37,7 @@ class Policy:
 
         self.version = max(1, self.versions.latest, latest_exported_version(name, registry.model_repository))
         self.updates = 0
+        self._decided_report_seq = 0  # versioning.score == 'report': last report seq acted on
         self.total_samples = 0
         self.last_stats = {}
 
@@ -121,7 +122,14 @@ class Policy:
             self.checkpoint()
 
     def _export_if_improved(self):
-        current = self.versions.current_train_score()
+        if self.spec.versioning.score == "report":
+            # one decision per report: the game's own score against the best exported version
+            if self.versions.last_report is None or self.versions.report_seq == self._decided_report_seq:
+                return
+            self._decided_report_seq = self.versions.report_seq
+            current = self.versions.last_report[1]
+        else:
+            current = self.versions.current_train_score()
         best = self.versions.best_score()
         if current is not None and (best is None or current > best):
             self.export()
@@ -135,6 +143,8 @@ class Policy:
             with self.weights_lock:
                 export_actor(self.algo.actor(), self.spec, self.name, version, self.reg.model_repository)
             self.versions.on_export(version)
+            if self.spec.versioning.score == "report":
+                self.versions.attribute_last_report(version)
             self._prune()
         return version
 

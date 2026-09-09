@@ -39,6 +39,10 @@ public:
 	bool bHeuristic = false;
 	bool bApproachShaping = false;
 	bool bPlaced = false; // curriculum placement done for this life
+	int32 PlacedStage = -1; // stage this life was placed in (-1 = Lyra's own spawn)
+
+	/** True while Lyra's warmup immunity (or any other) protects the pawn: nothing scores yet. */
+	bool HasDamageImmunity() const;
 
 	/** Teleport for curriculum placement; faces Yaw. */
 	void Place(const FVector& Location, float Yaw);
@@ -64,6 +68,7 @@ public:
 	float GetEpisodeReturn() const { return EpisodeReturn; }
 	int32 Kills = 0, Deaths = 0;
 	int32 Shots = 0, Hits = 0; // actual shots (magazine went down) and damage events dealt
+	bool IsDry() const { return DrySeconds > 5.f || JamSeconds > 5.f; } // wants to fire but no round has left the gun for a while
 
 	/** Identity helpers for reward attribution: pawn, controller or player state of this agent. */
 	bool Owns(const UObject* Obj) const;
@@ -81,8 +86,10 @@ private:
 	int32 GetMagazineAmmo(UObject* Item) const;
 	int32 GetStat(UObject* Item, const TCHAR* Tag) const;
 	void RefillAmmo();
+	void SetFireInput(class ULyraAbilitySystemComponent& ASC, bool bPressed); // both fire input tags (pistol / rifle & shotgun)
 	void UpdateWeapon(float DeltaTime);
 	void LogWeaponState() const;
+	void LogDryState(const TCHAR* Why) const; // Display: everything about the gun when it will not fire
 
 	int32 AgentId = -1;
 	TWeakObjectPtr<UManipleBotSubsystem> Subsystem;
@@ -96,6 +103,13 @@ private:
 	bool bMagazineEmpty = false; // no fire input until the magazine refills: firing cancels Lyra's reload ability
 	float ReloadRetryTimer = 0.f;
 	int32 LastMagazine = -1;
+	float DrySeconds = 0.f; // fire wanted and magazine empty (or no weapon) for this long
+	float StuckSeconds = 0.f; // ... of which with spare ammo available (a reload should have happened) or no item
+	bool bDryHealed = false; // refill + reload forced once per dry spell
+	float DryLogTimer = 0.f;
+	float JamSeconds = 0.f; // fire wanted, rounds in the magazine, nothing fired for this long
+	bool bJamHealed = false; // input abilities cancelled once per jam
+	float JamLogTimer = 0.f;
 	bool bDead = false;
 	float DebugTimer = 0.f;
 	bool bDebugLogged = false;

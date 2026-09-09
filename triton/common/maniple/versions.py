@@ -63,6 +63,10 @@ class VersionTracker:
         self.scores: dict[int, VersionScore] = defaultdict(VersionScore)
 
         self._recent_returns: deque[float] = deque(maxlen=score_window)
+        self.report_seq = 0  # counts report() calls; lets the trainer act once per new report
+        self.last_report: tuple[int, float, int] | None = (
+            None  # (version, score, episodes) of the newest report
+        )
         self._open_episodes: dict[tuple[int, int], float] = defaultdict(float)
         self._lock = threading.Lock()
         self._load()
@@ -118,13 +122,28 @@ class VersionTracker:
 
     def report(self, version: int, score: float, episodes: int = 1) -> None:
         with self._lock:
-            s = self.scores[version]
-            total = s.eval_episodes + episodes
-            previous = s.eval_score if s.eval_score is not None else 0.0
-            s.eval_score = (previous * s.eval_episodes + score * episodes) / total
-            s.eval_episodes = total
+            self._add_report(version, score, episodes)
+            self.report_seq += 1
+            self.last_report = (version, score, episodes)
             self._recompute_best()
             self._save()
+
+    def attribute_last_report(self, version: int) -> None:
+        """Give an unscored version the newest reported score (the export it just triggered)."""
+        with self._lock:
+            if self.last_report is None or self.scores[version].eval_score is not None:
+                return
+            _, score, episodes = self.last_report
+            self._add_report(version, score, episodes)
+            self._recompute_best()
+            self._save()
+
+    def _add_report(self, version: int, score: float, episodes: int) -> None:
+        s = self.scores[version]
+        total = s.eval_episodes + episodes
+        previous = s.eval_score if s.eval_score is not None else 0.0
+        s.eval_score = (previous * s.eval_episodes + score * episodes) / total
+        s.eval_episodes = total
 
     def promote(self, version: int) -> None:
         with self._lock:
@@ -176,6 +195,15 @@ class VersionTracker:
             "stable": self.stable,
             "exported": sorted(self.exported),
             "trt": self.trt,
+            "last_report": (
+                {
+                    "version": self.last_report[0],
+                    "score": self.last_report[1],
+                    "episodes": self.last_report[2],
+                }
+                if self.last_report
+                else None
+            ),
             "scores": {
                 str(v): s.to_json()
                 for v, s in sorted(self.scores.items())

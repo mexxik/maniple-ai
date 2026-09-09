@@ -6,8 +6,14 @@ JSON example (this is what the client sends with command=register):
   "action": {"type": "continuous", "dim": 6, "low": -1.0, "high": 1.0},
   "net":    {"preset": "medium", "activation": "relu", "layernorm": true, "normalize_obs": true},
   "ppo":    {"gamma": 0.99, "lam": 0.95, "clip": 0.2, "lr": 3e-4, "epochs": 4, "minibatch": 256, "rollout": 2048},
-  "versioning": {"score_window": 20, "export_on_improvement": true, "keep_exported": 3, "trt_on_promote": true}
+  "versioning": {"score_window": 20, "export_on_improvement": true, "keep_exported": 3, "trt_on_promote": true,
+                 "score": "return"}
 }
+
+versioning.score picks what "better" means: "return" (default) ranks versions by the mean return of finished
+training episodes; "report" ranks them by the score the client reports with command=report (a game-defined
+number such as kills per agent-minute), so exports on improvement wait for reports and shaping never leaks
+into the ranking.
 
 Network size, three ways (net.preset):
   "auto"                     width derived from the observation size, two layers   (default)
@@ -96,6 +102,14 @@ class VersioningConfig:
     export_on_improvement: bool = True  # export the current version when its training score beats 'best'
     keep_exported: int = 3  # newest exported versions kept on disk (best/stable are always kept)
     trt_on_promote: bool = True  # build a TensorRT engine for a version when it is promoted to 'stable'
+    score: str = (
+        "return"  # what ranks versions and triggers exports: "return" = mean training episode return,
+    )
+    #                        "report" = the score the game reports (command=report), e.g. kills per agent-minute
+
+    def validate(self) -> None:
+        if self.score not in ("return", "report"):
+            raise ValueError(f"unknown versioning.score '{self.score}' (return, report)")
 
 
 @dataclass
@@ -128,6 +142,7 @@ class AgentSpec:
             versioning=VersioningConfig(**data.get("versioning", {})),
         )
         spec.net.validate()
+        spec.versioning.validate()
         spec.net.resolve_hidden(spec.obs_dim)  # raises early on a bad preset
         return spec
 

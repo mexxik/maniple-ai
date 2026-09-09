@@ -34,11 +34,33 @@ struct FManipleStage
 };
 
 /**
+ * Score bookkeeping for one span of game time: a 5 s stats window, a 5 game-minute report, a whole evaluation.
+ * Time and kills are counted for policy bots in the final stage (or Lyra's own spawns) while they can take damage,
+ * so the score always means "in the real game", whatever the curriculum is doing.
+ */
+struct FManipleScoreSpan
+{
+	double GameSec = 0.0; // game time while at least one policy bot was damageable
+	double AgentSec = 0.0; // damageable policy-bot seconds in the final stage
+	int32 Kills = 0; // by final-stage policy bots
+	int32 Deaths = 0, Hits = 0, Shots = 0; // all policy bots
+	double Stat = 0.0; // stat tag delta summed over final-stage policy bots (EManipleScoreKind::Stat)
+	double Team = 0.0; // team tag delta, ours minus the best other team (EManipleScoreKind::Team)
+
+	void Add(const FManipleScoreSpan& O);
+	void Reset() { *this = FManipleScoreSpan(); }
+	double Minutes(EManipleScoreKind Kind) const { return (Kind == EManipleScoreKind::Team ? GameSec : AgentSec) / 60.0; }
+	double Score(EManipleScoreKind Kind) const; // per game-minute (Team) or per agent-minute (Kills, Stat)
+};
+
+/**
  * Created only when -ManipleBrain is set. Server side: finds Lyra bot controllers, attaches
  * UManipleAgentComponent to their pawns (also after respawn), optionally spawns extra bots, runs the
  * decision loop at DecisionHz (one act request for all policy agents, heuristic opponents locally), and in
  * train mode registers the policy, attributes rewards from Lyra's damage / elimination messages and sends
  * transitions back every tick. The curriculum places bots per stage and advances stages on the kill rate.
+ * The game-mode score (-ManipleScore) is reported to the trainer every 5 game-minutes so 'best' ranks by it,
+ * and -ManipleEval prints it once after a fixed span and quits.
  * Logs grep-friendly "bench:" / "train:" lines every 5 s of game time.
  */
 UCLASS()
@@ -73,6 +95,16 @@ private:
 	void FlushTransitions();
 	void UpdateSpectator(float DeltaTime);
 	void LogStats();
+
+	// score and evaluation
+	bool IsFinalPlacement(const UManipleAgentComponent& Agent) const;
+	int32 PolicyTeamId() const;
+	void AccumulateScoreTime(float Seconds); // once per decision
+	void SampleScore(); // stat / team deltas into the window
+	void SendReport(); // every KillWindowSlots windows in train mode
+	void UpdateEval(float DeltaTime);
+	void FinishEval();
+	void RequestQuit(const TCHAR* Why);
 
 	// curriculum
 	const FManipleStage* CurrentStage() const;
@@ -120,4 +152,18 @@ private:
 	TArray<double> WinTickLatencyMs;
 	int64 LastPolicyVersion = 0;
 	FString LastTrainStatus;
+
+	// score
+	FGameplayTag ScoreTag; // resolved from Config.ScoreTag
+	FManipleScoreSpan WinScore, ReportScore, EvalScore;
+	int32 ReportWindows = 0;
+	TMap<TWeakObjectPtr<APlayerState>, int32> LastStatCount; // Stat: last sampled tag count per player state
+	double LastTeamDiff = 0.0; // Team: last sampled (ours - best other)
+	bool bTeamDiffValid = false;
+
+	// evaluation (-ManipleEval)
+	bool bEvalStarted = false;
+	bool bEvalDone = false;
+	float EvalElapsed = 0.f;
+	double QuitAt = 0.0; // wall clock; 0 = not quitting
 };

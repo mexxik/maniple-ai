@@ -38,6 +38,11 @@ pitch every tick), builds the observation, applies the action every frame, reloa
 suppressed until it refills, since firing cancels the reload),
 and accumulates reward between decisions. One component is one episode: the pawn's death ends it.
 
+Fire presses both `InputTag.Weapon.Fire` (pistol) and `InputTag.Weapon.FireAuto` (rifle, shotgun): bots pick up the
+map's weapon spawners by walking over them and the new weapon becomes active. A watchdog logs a gun that wants to fire
+and cannot (`agent N dry (...)` with item, ammo, gameplay tags and abilities), forces a reload once, and cancels stuck
+input abilities; `dry=` in the `train:` line counts such bots (0 in a healthy run).
+
 ### Observation (32 floats, `ManipleLyraSchema.h`)
 
 | slot | content |
@@ -101,17 +106,43 @@ match never restarts.
 -ManipleLayerNorm=0|1
 -ManipleEntropy=0.01                         PPO entropy bonus, first registration only
 -ManipleLogStd=-1.0                          initial action noise (log std), first registration only
--ManipleLogStd=-1.0                          initial action noise (log std), first registration only
 -ManipleTimeScale=X                          world time dilation (windowed runs)
 -ManipleSpectate                             local player follows a bot; add ?SpectatorOnly=1 to the map URL
 -ManipleCurriculum=auto|off|N                see Curriculum
--ManipleOpponents=stage|self|mixed|heuristic
+-ManipleOpponents=stage|self|mixed|heuristic|lyra   lyra = the other team keeps Lyra's behaviour trees (benchmark)
 -ManipleEndless=0|1                          no score / time limit (train default 1)
 -ManipleSync=0|1                             wait for the policy reply inside the tick, deterministic timing (train default 1)
+-ManipleScore=kills|stat:<Tag>|team:<Tag>    what "score" means in this game mode, see Score and evaluation
+-ManipleEval=N                               evaluation: N game-seconds after the warmup, one "eval:" line, quit
+-ManipleEvalReport=0|1                       also send the evaluation score to the trainer (default 0)
 ```
 
 Faster than real time: run headless (`-nullrhi -unattended -nosound`) with `-benchmark -fps=30`; the game steps
 fixed 33 ms frames as fast as the CPU allows (about 9x real time with 11 bots on one core).
+
+### Score and evaluation
+
+The plugin turns the game mode into one number, the **score**, with `-ManipleScore`:
+
+| `-ManipleScore` | number | game modes |
+|---|---|---|
+| `kills` (default) | policy kills per agent-minute, from `Lyra.Elimination.Message` | elimination, deathmatch |
+| `stat:<Tag>` | a player-state stat tag summed over the policy bots, per agent-minute, e.g. `stat:ShooterGame.Score.ControlPointCapture` | anything that counts per player |
+| `team:<Tag>` | a team tag stack, our team minus the best other team, per game-minute, e.g. `team:ShooterGame.ControlPoint.TeamScore` | team objectives |
+
+Time only counts while a bot can take damage (Lyra's warmup immunity is excluded), and only bots in the final
+curriculum stage or on Lyra's own spawns count, so the score always means "in the real game".
+
+- **Training**: every 5 game-minutes the subsystem sends the score with `report` and the policy is registered
+  with `versioning.score = "report"`, so `best` is the exported version with the highest game score, not the
+  highest shaped return. Earlier curriculum stages send nothing; the first export happens once the policy plays
+  the final stage. The `train:` line shows the window's `score=` and its `score_min=` (agent-minutes behind it).
+- **Evaluation**: `-ManipleEval=300` waits for the warmup, runs 300 game-seconds, prints
+  `eval: mode=.. version=.. channel=.. opponents=.. stage=.. score=.. value=.. agents=.. game_min=.. agent_min=.. kills=.. deaths=.. hits=.. shots=..`
+  and quits. Works with every brain, so the heuristic and random bots give reference values. The standard
+  benchmark is infer mode against Lyra's own bots: `-ManipleMode=infer -ManipleChannel=<best|stable|n>
+  -ManipleOpponents=lyra -ManipleEval=300`. `-ManipleEvalReport=1` stores the value as that version's eval score
+  on the trainer.
 
 ### Training
 
@@ -122,7 +153,8 @@ UnrealEditor <Project>.uproject /ShooterMaps/Maps/L_Expanse -game -Experience=B_
 ```
 
 Log lines: `registered policy ...`, then every 5 s (game time) `bench: ...` (latency, served version) and
-`train: stage=.. rows=.. reward_sum=.. fire=.. shots=.. hits=.. episodes=.. placed=.. kills=.. heuristic_kills=.. deaths=.. kills_per_min=.. trainer=[.. std=..]`
+`train: stage=.. rows=.. reward_sum=.. fire=.. shots=.. hits=.. episodes=.. placed=.. kills=.. heuristic_kills=.. deaths=.. kills_per_min=.. score=.. score_min=.. dry=.. trainer=[.. std=..]`,
+every 5 game-minutes `report: version=.. score=..`
 (fire = fraction of decisions with the fire action on, shots = rounds that left the gun, hits = damage events dealt).
 `-LogCmds="LogManipleLyra Verbose"` adds one line per hit and per death.
 

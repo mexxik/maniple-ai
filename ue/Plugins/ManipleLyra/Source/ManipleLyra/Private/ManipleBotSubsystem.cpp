@@ -7,6 +7,8 @@
 #include "Player/LyraPlayerBotController.h"
 #include "Messages/LyraVerbMessage.h"
 #include "Teams/LyraTeamSubsystem.h"
+#include "Player/LyraPlayerState.h"
+#include "HAL/PlatformMisc.h"
 #include "AIController.h"
 #include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerController.h"
@@ -58,6 +60,36 @@ bool UManipleBotSubsystem::ShouldCreateSubsystem(UObject* Outer) const
 	return FManipleBotConfig::FromCommandLine().IsActive();
 }
 
+// ---------- score span ----------
+
+void FManipleScoreSpan::Add(const FManipleScoreSpan& O)
+{
+	GameSec += O.GameSec;
+	AgentSec += O.AgentSec;
+	Kills += O.Kills;
+	Deaths += O.Deaths;
+	Hits += O.Hits;
+	Shots += O.Shots;
+	Stat += O.Stat;
+	Team += O.Team;
+}
+
+double FManipleScoreSpan::Score(EManipleScoreKind Kind) const
+{
+	const double Min = Minutes(Kind);
+	if (Min <= 0.0)
+		return 0.0;
+	switch (Kind)
+	{
+	case EManipleScoreKind::Stat:
+		return Stat / Min;
+	case EManipleScoreKind::Team:
+		return Team / Min;
+	default:
+		return Kills / Min;
+	}
+}
+
 void UManipleBotSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
 	Super::Initialize(Collection);
@@ -98,6 +130,13 @@ void UManipleBotSubsystem::OnWorldStarted()
 			Msg.RegisterListener(FGameplayTag::RequestGameplayTag(TEXT("Lyra.Damage.Message")), this, &ThisClass::OnDamageMessage);
 		EliminationListener = Msg.RegisterListener(
 			FGameplayTag::RequestGameplayTag(TEXT("Lyra.Elimination.Message")), this, &ThisClass::OnEliminationMessage);
+	}
+
+	if (Config.ScoreKind != EManipleScoreKind::Kills)
+	{
+		ScoreTag = FGameplayTag::RequestGameplayTag(FName(*Config.ScoreTag), false);
+		if (!ScoreTag.IsValid())
+			UE_LOG(LogManipleLyra, Error, TEXT("-ManipleScore tag '%s' is not a registered gameplay tag: score stays 0"), *Config.ScoreTag);
 	}
 
 	if (Config.CurriculumStage >= 0)
@@ -156,6 +195,13 @@ void UManipleBotSubsystem::Tick(float DeltaTime)
 	{
 		StatsTimer = 0.f;
 		LogStats();
+	}
+
+	UpdateEval(DeltaTime);
+	if (QuitAt > 0.0 && FPlatformTime::Seconds() >= QuitAt)
+	{
+		QuitAt = 0.0;
+		FPlatformMisc::RequestExit(false);
 	}
 }
 
@@ -233,6 +279,7 @@ void UManipleBotSubsystem::ScanForBots()
 	OwnedControllers.RemoveAll([](const TWeakObjectPtr<AAIController>& C) { return !C.IsValid(); });
 
 	int32 BotControllers = 0;
+	const ULyraTeamSubsystem* Teams = GetWorld()->GetSubsystem<ULyraTeamSubsystem>();
 	for (TActorIterator<ALyraPlayerBotController> It(GetWorld()); It; ++It)
 	{
 		++BotControllers;
@@ -240,6 +287,13 @@ void UManipleBotSubsystem::ScanForBots()
 		APawn* Pawn = Ctrl->GetPawn();
 		if (!Pawn || Pawn->FindComponentByClass<UManipleAgentComponent>())
 			continue;
+		if (Config.Opponents == EManipleOpponents::Lyra)
+		{
+			// the higher team keeps its behaviour tree; wait until the team is known
+			const int32 Team = Teams ? Teams->FindTeamFromObject(Pawn) : INDEX_NONE;
+			if (Team == INDEX_NONE || Team > 1)
+				continue;
+		}
 
 		if (!OwnedControllers.Contains(Ctrl))
 		{
@@ -287,6 +341,7 @@ void UManipleBotSubsystem::Register()
 	Spec.bLayerNorm = Config.bLayerNorm;
 	Spec.LogStdInit = Config.LogStdInit;
 	Spec.Ppo.Add(TEXT("entropy_coef"), Config.EntropyCoef);
+	Spec.ScoreSource = TEXT("report"); // 'best' = the game-mode score we report, not the shaped return
 
 	TWeakObjectPtr<UManipleBotSubsystem> Self(this);
 	Agent->Register(Spec,
@@ -393,6 +448,8 @@ void UManipleBotSubsystem::Decide()
 				PlaceAgent(*W);
 		}
 	}
+
+	AccumulateScoreTime(1.f / Config.DecisionHz);
 
 	TArray<UManipleAgentComponent*> Ready;
 	TArray<float> Obs;
@@ -553,9 +610,15 @@ void UManipleBotSubsystem::OnEliminationMessage(FGameplayTag Channel, const FLyr
 	Killer->AddReward(RewardKill);
 	++Killer->Kills;
 	if (Killer->bHeuristic)
+	{
 		++WinHeuristicKills;
+	}
 	else
+	{
 		++WinKills;
+		if (IsFinalPlacement(*Killer))
+			++WinScore.Kills;
+	}
 }
 
 // ---------- curriculum ----------
@@ -619,6 +682,8 @@ const FManipleStage* UManipleBotSubsystem::PickPlacementStage() const
 void UManipleBotSubsystem::PlaceAgent(UManipleAgentComponent& A)
 {
 	const FManipleStage* S = PickPlacementStage();
+	if (S)
+		A.PlacedStage = (int32)(S - GStages);
 	if (S && S->Spawn == FManipleStage::ESpawn::Lyra)
 	{
 		A.bPlaced = true; // replaying the 'full' stage means keeping Lyra's spawn
@@ -777,17 +842,220 @@ void UManipleBotSubsystem::LogStats()
 	for (int32 K : KillHistory)
 		KillSum += K;
 	const double KillsPerMin = KillHistory.Num() > 0 ? KillSum / (KillHistory.Num() * 5.0 / 60.0) : 0.0;
+	int32 Dry = 0;
+	for (const TWeakObjectPtr<UManipleAgentComponent>& W : Agents)
+		if (W.IsValid() && W->IsReady() && W->IsDry())
+			++Dry;
+	SampleScore();
+	WinScore.Deaths = WinDeaths;
+	WinScore.Hits = WinHits;
+	WinScore.Shots = WinShots;
 	const FManipleStage* S = CurrentStage();
 	UE_LOG(LogManipleLyra, Display,
 		TEXT("train: stage=%s rows=%d reward_sum=%.3f fire=%.2f shots=%d hits=%d episodes=%d return_avg=%.3f placed=%d kills=%d "
-			 "heuristic_kills=%d deaths=%d kills_per_min=%.2f trainer=[%s]"),
+			 "heuristic_kills=%d deaths=%d kills_per_min=%.2f score=%.3f score_min=%.2f dry=%d trainer=[%s]"),
 		S ? S->Name : TEXT("off"), WinRows, WinRewardSum, WinActionRows > 0 ? (double)WinFireRows / WinActionRows : 0.0, WinShots, WinHits,
 		WinEpisodes, WinEpisodes > 0 ? WinReturnSum / WinEpisodes : 0.0, WinPlacements, WinKills, WinHeuristicKills, WinDeaths, KillsPerMin,
-		*LastTrainStatus);
+		WinScore.Score(Config.ScoreKind), WinScore.Minutes(Config.ScoreKind), Dry, *LastTrainStatus);
 	UpdateCurriculum();
+
+	ReportScore.Add(WinScore);
+	EvalScore.Add(WinScore);
+	WinScore.Reset();
+	if (++ReportWindows >= KillWindowSlots)
+	{
+		ReportWindows = 0;
+		SendReport();
+	}
 
 	WinTicks = WinRequests = WinFailures = WinFrames = WinRows = WinEpisodes = WinKills = WinHeuristicKills = WinDeaths = 0;
 	WinActionRows = WinFireRows = WinPlacements = WinShots = WinHits = 0;
 	WinFrameSec = WinReturnSum = WinRewardSum = 0.0;
 	WinTickLatencyMs.Reset();
+}
+
+// ---------- score ----------
+
+bool UManipleBotSubsystem::IsFinalPlacement(const UManipleAgentComponent& A) const
+{
+	return A.PlacedStage < 0 || A.PlacedStage == NumStages - 1;
+}
+
+int32 UManipleBotSubsystem::PolicyTeamId() const
+{
+	const ULyraTeamSubsystem* Teams = GetWorld()->GetSubsystem<ULyraTeamSubsystem>();
+	if (!Teams)
+		return INDEX_NONE;
+	for (const TWeakObjectPtr<UManipleAgentComponent>& W : Agents)
+	{
+		if (W.IsValid() && !W->bHeuristic)
+			return Teams->FindTeamFromObject(W->GetOwner());
+	}
+	return INDEX_NONE;
+}
+
+void UManipleBotSubsystem::AccumulateScoreTime(float Seconds)
+{
+	bool bAnyDamageable = false;
+	for (const TWeakObjectPtr<UManipleAgentComponent>& W : Agents)
+	{
+		const UManipleAgentComponent* A = W.Get();
+		if (!A || A->bHeuristic || !A->IsReady() || A->HasDamageImmunity())
+			continue;
+		bAnyDamageable = true;
+		if (IsFinalPlacement(*A))
+			WinScore.AgentSec += Seconds;
+	}
+	if (bAnyDamageable)
+		WinScore.GameSec += Seconds;
+}
+
+void UManipleBotSubsystem::SampleScore()
+{
+	if (Config.ScoreKind == EManipleScoreKind::Kills || !ScoreTag.IsValid())
+		return;
+
+	if (Config.ScoreKind == EManipleScoreKind::Stat)
+	{
+		for (const TWeakObjectPtr<UManipleAgentComponent>& W : Agents)
+		{
+			const UManipleAgentComponent* A = W.Get();
+			if (!A || A->bHeuristic || !IsFinalPlacement(*A))
+				continue;
+			ALyraPlayerState* PS = Cast<ALyraPlayerState>(A->GetPlayerState());
+			if (!PS)
+				continue;
+			const int32 Count = PS->GetStatTagStackCount(ScoreTag);
+			if (const int32* Last = LastStatCount.Find(PS))
+				WinScore.Stat += Count - *Last;
+			LastStatCount.Add(PS, Count);
+		}
+		return;
+	}
+
+	// Team: whole-team tag, only meaningful when the policy team plays the real game (final stage or no curriculum)
+	if (Stage >= 0 && Stage != NumStages - 1)
+		return;
+	const ULyraTeamSubsystem* Teams = GetWorld()->GetSubsystem<ULyraTeamSubsystem>();
+	const int32 Ours = PolicyTeamId();
+	if (!Teams || Ours == INDEX_NONE)
+		return;
+	int32 BestOther = 0;
+	for (int32 Team : Teams->GetTeamIDs())
+	{
+		if (Team != Ours)
+			BestOther = FMath::Max(BestOther, Teams->GetTeamTagStackCount(Team, ScoreTag));
+	}
+	const double Diff = Teams->GetTeamTagStackCount(Ours, ScoreTag) - BestOther;
+	if (bTeamDiffValid)
+		WinScore.Team += Diff - LastTeamDiff;
+	LastTeamDiff = Diff;
+	bTeamDiffValid = true;
+}
+
+void UManipleBotSubsystem::SendReport()
+{
+	const FManipleScoreSpan Span = ReportScore;
+	ReportScore.Reset();
+	if (!Config.IsTraining() || !bRegistered || !Agent.IsValid() || LastPolicyVersion <= 0)
+		return;
+	const double Minutes = Span.Minutes(Config.ScoreKind);
+	if (Minutes < 0.5)
+		return; // nobody played the real game in this span (earlier curriculum stages only)
+
+	const double Score = Span.Score(Config.ScoreKind);
+	const int64 Weight = FMath::Max<int64>(1, FMath::RoundToInt64(Minutes));
+	UE_LOG(LogManipleLyra, Display, TEXT("report: version=%lld score=%.3f (%s) minutes=%.1f kills=%d"), LastPolicyVersion, Score,
+		*Config.ScoreToString(), Minutes, Span.Kills);
+	Agent->Report(LastPolicyVersion, (float)Score, Weight,
+		[](const FManipleAgentStatus& S)
+		{
+			if (!S.bOk)
+				UE_LOG(LogManipleLyra, Warning, TEXT("report failed: %s"), *S.Error);
+		});
+}
+
+// ---------- evaluation ----------
+
+void UManipleBotSubsystem::UpdateEval(float DeltaTime)
+{
+	if (Config.EvalSeconds <= 0.f || bEvalDone)
+		return;
+
+	if (!bEvalStarted)
+	{
+		for (const TWeakObjectPtr<UManipleAgentComponent>& W : Agents)
+		{
+			const UManipleAgentComponent* A = W.Get();
+			if (A && !A->bHeuristic && A->IsReady() && !A->HasDamageImmunity())
+			{
+				bEvalStarted = true;
+				break;
+			}
+		}
+		if (bEvalStarted)
+		{
+			EvalScore.Reset();
+			UE_LOG(LogManipleLyra, Display, TEXT("eval: started, %.0f game-seconds"), Config.EvalSeconds);
+		}
+		return;
+	}
+
+	EvalElapsed += DeltaTime;
+	if (EvalElapsed >= Config.EvalSeconds)
+		FinishEval();
+}
+
+void UManipleBotSubsystem::FinishEval()
+{
+	bEvalDone = true;
+	LogStats(); // folds the partial window into EvalScore
+
+	int32 PolicyAgents = 0;
+	for (const TWeakObjectPtr<UManipleAgentComponent>& W : Agents)
+		if (W.IsValid() && !W->bHeuristic)
+			++PolicyAgents;
+
+	const TCHAR* Mode = Config.Brain == EManipleBrain::Random ? TEXT("random")
+		: Config.Brain == EManipleBrain::Heuristic			  ? TEXT("heuristic")
+		: Config.IsTraining()								  ? TEXT("train")
+															  : TEXT("infer");
+	const FManipleStage* S = CurrentStage();
+	const double Score = EvalScore.Score(Config.ScoreKind);
+	const double Minutes = EvalScore.Minutes(Config.ScoreKind);
+	UE_LOG(LogManipleLyra, Display,
+		TEXT("eval: mode=%s model=%s version=%lld channel=%s opponents=%s stage=%s score=%s value=%.3f agents=%d game_min=%.2f "
+			 "agent_min=%.2f kills=%d deaths=%d hits=%d shots=%d"),
+		Mode, *Config.Model, LastPolicyVersion, Config.IsTraining() ? TEXT("latest") : *Config.Channel, Config.OpponentsToString(),
+		S ? S->Name : TEXT("off"), *Config.ScoreToString(), Score, PolicyAgents, EvalScore.GameSec / 60.0, EvalScore.AgentSec / 60.0,
+		EvalScore.Kills, EvalScore.Deaths, EvalScore.Hits, EvalScore.Shots);
+
+	if (Config.bEvalReport && Agent.IsValid() && LastPolicyVersion > 0 && Minutes > 0.0)
+	{
+		const int64 Weight = FMath::Max<int64>(1, FMath::RoundToInt64(Minutes));
+		TWeakObjectPtr<UManipleBotSubsystem> Self(this);
+		Agent->Report(LastPolicyVersion, (float)Score, Weight,
+			[Self](const FManipleAgentStatus& St)
+			{
+				if (St.bOk)
+				{
+					UE_LOG(LogManipleLyra, Display, TEXT("eval: score reported: %s"), *St.ToString());
+				}
+				else
+				{
+					UE_LOG(LogManipleLyra, Warning, TEXT("eval: report failed: %s"), *St.Error);
+				}
+				if (Self.IsValid())
+					Self->RequestQuit(TEXT("evaluation reported"));
+			});
+		QuitAt = FPlatformTime::Seconds() + 10.0; // in case the reply never comes
+		return;
+	}
+	RequestQuit(TEXT("evaluation done"));
+}
+
+void UManipleBotSubsystem::RequestQuit(const TCHAR* Why)
+{
+	UE_LOG(LogManipleLyra, Display, TEXT("quitting: %s"), Why);
+	QuitAt = FPlatformTime::Seconds(); // next tick, outside any callback
 }

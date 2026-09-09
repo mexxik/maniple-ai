@@ -96,9 +96,63 @@ FManipleBotConfig FManipleBotConfig::FromCommandLine()
 			C.Opponents = EManipleOpponents::Mixed;
 		else if (Opp.Equals(TEXT("heuristic"), ESearchCase::IgnoreCase))
 			C.Opponents = EManipleOpponents::Heuristic;
+		else if (Opp.Equals(TEXT("lyra"), ESearchCase::IgnoreCase))
+			C.Opponents = EManipleOpponents::Lyra;
 	}
 
+	// ---- score and evaluation ----
+	FString Score;
+	if (FParse::Value(Cmd, TEXT("ManipleScore="), Score))
+	{
+		FString Kind, Tag;
+		if (!Score.Split(TEXT(":"), &Kind, &Tag))
+			Kind = Score;
+		if (Kind.Equals(TEXT("stat"), ESearchCase::IgnoreCase))
+			C.ScoreKind = EManipleScoreKind::Stat;
+		else if (Kind.Equals(TEXT("team"), ESearchCase::IgnoreCase))
+			C.ScoreKind = EManipleScoreKind::Team;
+		else
+			C.ScoreKind = EManipleScoreKind::Kills;
+		C.ScoreTag = Tag;
+	}
+	FParse::Value(Cmd, TEXT("ManipleEval="), C.EvalSeconds);
+	if (C.EvalSeconds > 0.f)
+		C.bEndless = true; // the evaluation decides when the match is over
+	int32 EvalReport = 0;
+	if (FParse::Value(Cmd, TEXT("ManipleEvalReport="), EvalReport))
+		C.bEvalReport = EvalReport != 0;
+
 	return C;
+}
+
+const TCHAR* FManipleBotConfig::OpponentsToString() const
+{
+	switch (Opponents)
+	{
+	case EManipleOpponents::Self:
+		return TEXT("self");
+	case EManipleOpponents::Mixed:
+		return TEXT("mixed");
+	case EManipleOpponents::Heuristic:
+		return TEXT("heuristic");
+	case EManipleOpponents::Lyra:
+		return TEXT("lyra");
+	default:
+		return TEXT("stage");
+	}
+}
+
+FString FManipleBotConfig::ScoreToString() const
+{
+	switch (ScoreKind)
+	{
+	case EManipleScoreKind::Stat:
+		return TEXT("stat:") + ScoreTag;
+	case EManipleScoreKind::Team:
+		return TEXT("team:") + ScoreTag;
+	default:
+		return TEXT("kills");
+	}
 }
 
 FString FManipleBotConfig::ToString() const
@@ -113,17 +167,14 @@ FString FManipleBotConfig::ToString() const
 	for (int32 W : Hidden)
 		HiddenStr += (HiddenStr.IsEmpty() ? TEXT("") : TEXT(",")) + FString::FromInt(W);
 
-	const TCHAR* OppStr = Opponents == EManipleOpponents::Self ? TEXT("self")
-		: Opponents == EManipleOpponents::Mixed				   ? TEXT("mixed")
-		: Opponents == EManipleOpponents::Heuristic			   ? TEXT("heuristic")
-															   : TEXT("stage");
+	const TCHAR* OppStr = OpponentsToString();
 	const FString CurriculumStr = CurriculumStage < 0 ? TEXT("off") : bCurriculumAuto ? TEXT("auto") : FString::FromInt(CurriculumStage);
 
 	return FString::Printf(
-		TEXT(
-			"brain=%s mode=%s model=%s url=%s channel=%s explore=%d bots=%s hz=%.0f spawn=%d net=%s hidden=[%s] "
-			"activation=%s layernorm=%d entropy=%.3f logstd=%.2f timescale=%.1f spectate=%d curriculum=%s opponents=%s endless=%d sync=%d"),
+		TEXT("brain=%s mode=%s model=%s url=%s channel=%s explore=%d bots=%s hz=%.0f spawn=%d net=%s hidden=[%s] "
+			 "activation=%s layernorm=%d entropy=%.3f logstd=%.2f timescale=%.1f spectate=%d curriculum=%s opponents=%s endless=%d sync=%d "
+			 "score=%s eval=%.0f eval_report=%d"),
 		BrainStr, ModeStr, *Model, *TritonUrl, *Channel, bExplore ? 1 : 0, MaxBots < 0 ? TEXT("all") : *FString::FromInt(MaxBots),
 		DecisionHz, SpawnBots, *NetPreset, *HiddenStr, *Activation, bLayerNorm ? 1 : 0, EntropyCoef, LogStdInit, TimeScale,
-		bSpectate ? 1 : 0, *CurriculumStr, OppStr, bEndless ? 1 : 0, bSyncAct ? 1 : 0);
+		bSpectate ? 1 : 0, *CurriculumStr, OppStr, bEndless ? 1 : 0, bSyncAct ? 1 : 0, *ScoreToString(), EvalSeconds, bEvalReport ? 1 : 0);
 }

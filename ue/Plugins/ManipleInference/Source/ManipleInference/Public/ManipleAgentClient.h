@@ -31,6 +31,10 @@ struct MANIPLEINFERENCE_API FManipleAgentSpec
 	// ppo.* overrides, key -> number (e.g. "lr" -> 3e-4, "rollout" -> 2048); empty = trainer defaults
 	TMap<FString, double> Ppo;
 
+	// versioning.score: what ranks versions and triggers exports. "return" = mean training episode return (default),
+	// "report" = the score this client sends with Report() (a game-defined number, e.g. kills per agent-minute)
+	FString ScoreSource;
+
 	FString ToJson() const;
 };
 
