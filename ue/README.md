@@ -28,9 +28,14 @@ The gRPC library and Triton protos are prebuilt into `ManipleInference/Source/Th
   (named tensors) collect the transitions. Actions come back as one flat row per agent over all groups
   (`FManipleActResult::Row`), with the chosen index per discrete group (`Index(row, group)`).
 - `FManipleBatchInferer` — generic client-side batching for plain models (obs in, action out).
+- `FManipleRecorder` — writes transition batches (the rows of `observe`, plus any extra per-row columns) to a
+  recording directory: one `.npy` file per column, `meta.json` next to them, headers patched on every flush so a
+  crash leaves readable files. `FManipleRecording` reads one back. The format, the Python reader and the tools
+  are in `triton/common/maniple/recording.py` and `tools/recording.py`.
 
-Tests (`Automation RunTests Maniple`, Triton must be up): `Maniple.Triton.Smoke` registers a throwaway policy
-`uesmoke`, acts, observes and reads status; `Maniple.Triton.Batch` measures round trips by batch size.
+Tests (`Automation RunTests Maniple`): `Maniple.Recorder.RoundTrip` needs no server; `Maniple.Triton.Smoke`
+registers a throwaway policy `uesmoke`, acts, observes and reads status, and `Maniple.Triton.Batch` measures
+round trips by batch size (Triton must be up for those two).
 
 ## ManipleLyra
 
@@ -121,6 +126,10 @@ match never restarts.
 -ManipleScore=kills|stat:<Tag>|team:<Tag>    what "score" means in this game mode, see Score and evaluation
 -ManipleEval=N                               evaluation: N game-seconds after the warmup, one "eval:" line, quit
 -ManipleEvalReport=0|1                       also send the evaluation score to the trainer (default 0)
+-ManipleRecord[=<dir>]                       record every agent's play, see Recording and replay (default dir
+                                             Saved/Maniple/recordings/<model>-<time>); works with every brain, also none
+-ManipleRecordWho=all|policy,heuristic,lyra,human,replay,random   which agents to record (default all)
+-ManipleBrain=replay -ManipleReplay=<dir>[:<agent>]   drive one bot with the recorded actions of <agent> (default 0)
 ```
 
 Faster than real time: run headless (`-nullrhi -unattended -nosound`) with `-benchmark -fps=30`; the game steps
@@ -149,6 +158,51 @@ curriculum stage or on Lyra's own spawns count, so the score always means "in th
   benchmark is infer mode against Lyra's own bots: `-ManipleMode=infer -ManipleChannel=<best|stable|n>
   -ManipleOpponents=lyra -ManipleEval=300`. `-ManipleEvalReport=1` stores the value as that version's eval score
   on the trainer.
+
+### Recording and replay
+
+`-ManipleRecord` writes what every agent saw and did to a recording directory (`Saved/Maniple/recordings/<model>-<time>`
+unless a path is given): the 32-float observation, the 5-float action, the shaped reward, `done`, `logp` and
+`policy_version` (0 for anything not driven by the policy), `agent_id`, `episode_id`, and three Lyra extras:
+`time` (game seconds), `kind` (who produced the row) and `pose` (world x, y, z, view yaw and pitch at the
+observation). `meta.json` carries the map, the config, the decision rate and the observation / action layout, so
+nothing outside the plugin needs the schema header. One row per agent per decision; an episode is one life or 60 s.
+
+Who gets recorded, and where the action comes from:
+
+| kind | who | action |
+|---|---|---|
+| `policy` | bots driven by Triton | what the policy returned |
+| `heuristic`, `random` | the built-in brains | what the brain chose |
+| `lyra` | Lyra's own behaviour-tree bots (`-ManipleBrain=none`, the other team with `-ManipleOpponents=lyra`, bots beyond `-ManipleBots`) | derived from the pawn |
+| `human` | the local player, in a window | derived from the pawn |
+| `replay` | the bot driven by `-ManipleBrain=replay` | the recorded action |
+
+Lyra bots and the human are *observed*: the component leaves their controller alone, builds the same observation
+from the controller's view, and turns what the pawn did between two decisions into an action: move from the mean
+velocity in the view frame over the max walk speed, yaw and pitch rate from the control rotation delta (a mouse
+flick faster than 120 deg/s clips to 1), fire from the fire ability being active, or a round leaving the magazine.
+Rewards are attributed the same way as for policy bots. Observed agents never count for the score or the stats.
+
+Replay: `-ManipleBrain=replay -ManipleReplay=<dir>[:<agent>] -ManipleBots=1` takes over one bot, teleports it to the
+recorded pose at the start of every recorded episode and feeds it the recorded actions at the recorded rate, then
+quits when the rows are used up. The world around it will not repeat (other bots do their own thing), so what does
+repeat is the bot's own motion: record the replay too and compare the observation fields step by step with
+`tools/recording.py compare <recorded> <replayed>`. Velocity, pitch and rays should match closely; the enemy block
+will not.
+
+```
+# an hour of Lyra's own bots, headless, 5x faster than real time
+UnrealEditor <Project>.uproject /ShooterMaps/Maps/L_Expanse -game -Experience=B_ShooterGame_Elimination -nullrhi -unattended -nosound \
+  -benchmark -fps=30 -ManipleBrain=none -ManipleRecord -ManipleEndless=1
+# the heuristic brain (team 1) against Lyra's bots (team 2, observed): both kinds in one recording
+  ... -ManipleBrain=heuristic -ManipleOpponents=lyra -ManipleRecord -ManipleEndless=1
+# you, in a window (no server needed)
+DISPLAY=:0 UnrealEditor <Project>.uproject /ShooterMaps/Maps/L_Expanse -game -Experience=B_ShooterGame_Elimination -ManipleRecord -ManipleRecordWho=human,lyra
+# look at it
+tools/recording.py info <dir> --episodes 10
+tools/recording.py dump <dir> --agent 0 --episode 0
+```
 
 ### Training
 

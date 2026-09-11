@@ -35,6 +35,9 @@ namespace ManipleLyra
 	constexpr float MaxYawDegPerSec = 120.f;
 	constexpr float MaxPitchDegPerSec = 60.f;
 
+	// recording extras: pose of the agent at the observation (world x, y, z in cm, view yaw and pitch in degrees)
+	constexpr int32 PoseDim = 5;
+
 	// reward shaping v1 (per decision step); damage is scaled by max health so one full kill's worth of damage = 1
 	constexpr float RewardKill = 1.f;
 	constexpr float RewardDeath = -1.f;

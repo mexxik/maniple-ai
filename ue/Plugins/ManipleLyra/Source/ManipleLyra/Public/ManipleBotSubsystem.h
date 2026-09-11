@@ -6,10 +6,12 @@
 #include "GameFramework/GameplayMessageSubsystem.h"
 #include "ManipleAgentClient.h"
 #include "ManipleBotConfig.h"
+#include "ManipleRecorder.h"
 #include "ManipleBotSubsystem.generated.h"
 
 class FManipleTritonClient;
 class UManipleAgentComponent;
+class AController;
 class AAIController;
 struct FLyraVerbMessage;
 
@@ -61,6 +63,8 @@ struct FManipleScoreSpan
  * transitions back every tick. The curriculum places bots per stage and advances stages on the kill rate.
  * The game-mode score (-ManipleScore) is reported to the trainer every 5 game-minutes so 'best' ranks by it,
  * and -ManipleEval prints it once after a fixed span and quits.
+ * -ManipleRecord writes every transition (of policy bots, heuristic bots, Lyra's own bots and the local player, the
+ * last two as observers) to a recording directory; -ManipleBrain=replay drives one bot with a recording's actions.
  * Logs grep-friendly "bench:" / "train:" lines every 5 s of game time.
  */
 UCLASS()
@@ -88,6 +92,7 @@ public:
 private:
 	void OnWorldStarted();
 	void ScanForBots();
+	void Attach(APawn* Pawn, EManipleAgentKind Kind, bool bDriven);
 	void SpawnExtraBots();
 	void MakeEndless();
 	void Register();
@@ -114,6 +119,12 @@ private:
 	const FManipleStage* PickPlacementStage() const; // current stage, or an easier one for a share of placements
 	void UpdateCurriculum();
 
+	// recording and replay
+	void OpenRecorder();
+	TSharedPtr<FJsonObject> RecordingMeta() const;
+	bool LoadReplay();
+	void DriveReplay(UManipleAgentComponent& A); // one decision of the replayed bot
+
 	// reward attribution
 	void OnDamageMessage(FGameplayTag Channel, const FLyraVerbMessage& Msg);
 	void OnEliminationMessage(FGameplayTag Channel, const FLyraVerbMessage& Msg);
@@ -128,7 +139,8 @@ private:
 	double RegisterRetryAt = 0.0;
 	bool bWorldStarted = false;
 
-	TArray<TWeakObjectPtr<AAIController>> OwnedControllers;
+	TArray<TWeakObjectPtr<AAIController>> OwnedControllers; // driven bots
+	TArray<TWeakObjectPtr<AController>> ObservedControllers; // Lyra's own bots and the local player, recorded only
 	TArray<TWeakObjectPtr<UManipleAgentComponent>> Agents; // refreshed each scan
 	int32 NextAgentId = 0;
 	bool bSpawnedExtra = false;
@@ -166,4 +178,19 @@ private:
 	bool bEvalDone = false;
 	float EvalElapsed = 0.f;
 	double QuitAt = 0.0; // wall clock; 0 = not quitting
+
+	// recording (-ManipleRecord): the rows of one tick, written after the observe batch
+	TUniquePtr<FManipleRecorder> Recorder;
+	FManipleTransitionBatch Recorded;
+	TArray<float> RecordedTime; // game seconds at the observation
+	TArray<uint8> RecordedKind; // EManipleAgentKind
+	TArray<float> RecordedPose; // [rows, PoseDim]
+
+	// replay (-ManipleBrain=replay): rows of the chosen recorded agent, one per decision
+	FManipleRecording Replay;
+	TArray<int64> ReplayRows;
+	int32 ReplayCursor = 0;
+	bool bReplayEpisodeStart = true; // next row starts a recorded episode: place the bot at its pose first
+	TWeakObjectPtr<UManipleAgentComponent> ReplayComponent; // the pawn being driven; a new one means it died mid-episode
+	bool bReplayDone = false;
 };

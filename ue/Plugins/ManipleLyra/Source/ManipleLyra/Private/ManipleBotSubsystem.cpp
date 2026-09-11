@@ -4,6 +4,9 @@
 #include "ManipleAgentComponent.h"
 #include "ManipleTritonClient.h"
 #include "Dom/JsonObject.h"
+#include "Serialization/JsonReader.h"
+#include "Serialization/JsonSerializer.h"
+#include "Misc/DateTime.h"
 #include "Player/LyraPlayerBotController.h"
 #include "Messages/LyraVerbMessage.h"
 #include "Teams/LyraTeamSubsystem.h"
@@ -95,11 +98,14 @@ void UManipleBotSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	Super::Initialize(Collection);
 	Config = FManipleBotConfig::FromCommandLine();
 	Transitions = FManipleTransitionBatch(ObsDim, ActDim);
+	Recorded = FManipleTransitionBatch(ObsDim, ActDim);
 	if (Config.Brain == EManipleBrain::Triton)
 	{
 		Client = MakeShared<FManipleTritonClient>(Config.TritonUrl, 2.f);
 		Agent = MakeShared<FManipleAgentClient>(Client, Config.Model);
 	}
+	if (Config.Brain == EManipleBrain::Replay && !LoadReplay())
+		Config.Brain = EManipleBrain::None;
 	UE_LOG(LogManipleLyra, Display, TEXT("bot subsystem active: %s"), *Config.ToString());
 }
 
@@ -114,6 +120,8 @@ void UManipleBotSubsystem::Deinitialize()
 			Msg->UnregisterListener(EliminationListener);
 		}
 	}
+	if (Recorder.IsValid())
+		Recorder->Close();
 	Agent.Reset();
 	Client.Reset();
 	Super::Deinitialize();
@@ -145,6 +153,9 @@ void UManipleBotSubsystem::OnWorldStarted()
 			(Config.bCurriculumAuto && GPersistentStage > Config.CurriculumStage) ? GPersistentStage : Config.CurriculumStage;
 		ApplyStage(FMath::Clamp(Start, 0, NumStages - 1));
 	}
+
+	if (Config.IsRecording())
+		OpenRecorder();
 
 	if (Config.TimeScale != 1.f)
 	{
@@ -278,8 +289,11 @@ void UManipleBotSubsystem::ScanForBots()
 {
 	OwnedControllers.RemoveAll([](const TWeakObjectPtr<AAIController>& C) { return !C.IsValid(); });
 
+	ObservedControllers.RemoveAll([](const TWeakObjectPtr<AController>& C) { return !C.IsValid(); });
+
 	int32 BotControllers = 0;
 	const ULyraTeamSubsystem* Teams = GetWorld()->GetSubsystem<ULyraTeamSubsystem>();
+	const bool bDriveBots = Config.Brain != EManipleBrain::None;
 	for (TActorIterator<ALyraPlayerBotController> It(GetWorld()); It; ++It)
 	{
 		++BotControllers;
@@ -287,24 +301,53 @@ void UManipleBotSubsystem::ScanForBots()
 		APawn* Pawn = Ctrl->GetPawn();
 		if (!Pawn || Pawn->FindComponentByClass<UManipleAgentComponent>())
 			continue;
-		if (Config.Opponents == EManipleOpponents::Lyra)
+
+		// Lyra keeps this bot (no brain at all, the other team with -ManipleOpponents=lyra, or beyond -ManipleBots):
+		// it is only observed, and only when recording asks for Lyra's bots
+		bool bLyraKeeps = !bDriveBots;
+		if (bDriveBots && Config.Opponents == EManipleOpponents::Lyra)
 		{
 			// the higher team keeps its behaviour tree; wait until the team is known
 			const int32 Team = Teams ? Teams->FindTeamFromObject(Pawn) : INDEX_NONE;
-			if (Team == INDEX_NONE || Team > 1)
+			if (Team == INDEX_NONE)
 				continue;
+			bLyraKeeps = Team > 1;
 		}
-
-		if (!OwnedControllers.Contains(Ctrl))
+		if (!bLyraKeeps && !OwnedControllers.Contains(Ctrl))
 		{
 			if (Config.MaxBots >= 0 && OwnedControllers.Num() >= Config.MaxBots)
-				continue;
-			OwnedControllers.Add(Ctrl);
+				bLyraKeeps = true;
+			else
+				OwnedControllers.Add(Ctrl);
 		}
-		UManipleAgentComponent* NewAgent = NewObject<UManipleAgentComponent>(Pawn, TEXT("ManipleAgent"));
-		NewAgent->Init(NextAgentId++, this);
-		AssignRole(*NewAgent);
-		NewAgent->RegisterComponent();
+		if (bLyraKeeps)
+		{
+			if (Config.Records(EManipleAgentKind::Lyra))
+			{
+				ObservedControllers.AddUnique(Ctrl);
+				Attach(Pawn, EManipleAgentKind::Lyra, false);
+			}
+			continue;
+		}
+		const EManipleAgentKind Kind = Config.Brain == EManipleBrain::Random ? EManipleAgentKind::Random
+			: Config.Brain == EManipleBrain::Heuristic						 ? EManipleAgentKind::Heuristic
+			: Config.Brain == EManipleBrain::Replay							 ? EManipleAgentKind::Replay
+																			 : EManipleAgentKind::Policy;
+		Attach(Pawn, Kind, true);
+	}
+
+	// the local player, observed only
+	if (Config.Records(EManipleAgentKind::Human))
+	{
+		for (FConstPlayerControllerIterator It = GetWorld()->GetPlayerControllerIterator(); It; ++It)
+		{
+			APlayerController* PC = It->Get();
+			APawn* Pawn = PC ? PC->GetPawn() : nullptr;
+			if (!Pawn || !Pawn->IsA<ALyraCharacter>() || Pawn->FindComponentByClass<UManipleAgentComponent>())
+				continue;
+			ObservedControllers.AddUnique(PC);
+			Attach(Pawn, EManipleAgentKind::Human, false);
+		}
 	}
 
 	// Lyra's own bots exist -> the experience is up; add ours once.
@@ -318,13 +361,26 @@ void UManipleBotSubsystem::ScanForBots()
 
 	// keep dying agents around until their last transition is flushed; drop only dead objects
 	Agents.RemoveAll([](const TWeakObjectPtr<UManipleAgentComponent>& A) { return !A.IsValid(); });
-	for (const TWeakObjectPtr<AAIController>& C : OwnedControllers)
+	auto Track = [this](const AController* C)
 	{
-		APawn* Pawn = C.IsValid() ? C->GetPawn() : nullptr;
+		APawn* Pawn = C ? C->GetPawn() : nullptr;
 		UManipleAgentComponent* A = Pawn ? Pawn->FindComponentByClass<UManipleAgentComponent>() : nullptr;
 		if (A && !Agents.Contains(A))
 			Agents.Add(A);
-	}
+	};
+	for (const TWeakObjectPtr<AAIController>& C : OwnedControllers)
+		Track(C.Get());
+	for (const TWeakObjectPtr<AController>& C : ObservedControllers)
+		Track(C.Get());
+}
+
+void UManipleBotSubsystem::Attach(APawn* Pawn, EManipleAgentKind Kind, bool bDriven)
+{
+	UManipleAgentComponent* NewAgent = NewObject<UManipleAgentComponent>(Pawn, TEXT("ManipleAgent"));
+	NewAgent->Init(NextAgentId++, Kind, this);
+	if (bDriven)
+		AssignRole(*NewAgent);
+	NewAgent->RegisterComponent();
 }
 
 // ---------- training protocol ----------
@@ -367,7 +423,14 @@ void UManipleBotSubsystem::Register()
 void UManipleBotSubsystem::AddTransition(const UManipleAgentComponent& A, TConstArrayView<float> Obs, TConstArrayView<float> Action,
 	float Reward, bool bDone, float LogP, int64 PolicyVersion)
 {
-	if (!Config.IsTraining() || A.bHeuristic)
+	if (Recorder.IsValid() && Config.Records(A.Kind))
+	{
+		Recorded.Add(Obs, Action, Reward, bDone, A.GetAgentId(), A.GetEpisodeId(), PolicyVersion, LogP);
+		RecordedTime.Add(A.GetTransitionTime());
+		RecordedKind.Add((uint8)A.Kind);
+		RecordedPose.Append(A.GetTransitionPose().GetData(), PoseDim);
+	}
+	if (!Config.IsTraining() || A.Kind != EManipleAgentKind::Policy)
 		return;
 	Transitions.Add(Obs, Action, Reward, bDone, A.GetAgentId(), A.GetEpisodeId(), PolicyVersion, LogP);
 	WinRewardSum += Reward;
@@ -386,7 +449,7 @@ void UManipleBotSubsystem::OnAgentDied(const UManipleAgentComponent& A)
 
 void UManipleBotSubsystem::OnAgentShot(const UManipleAgentComponent& A)
 {
-	if (!A.bHeuristic)
+	if (A.IsScored())
 		++WinShots;
 }
 
@@ -410,7 +473,22 @@ void UManipleBotSubsystem::FlushTransitions()
 				A->bPlaced = false; // fresh start for the next episode
 		}
 	}
-	if (Transitions.Num() == 0)
+	if (Recorder.IsValid() && Recorded.Num() > 0)
+	{
+		const int64 N = Recorded.Num();
+		const int64 Flat[1] = {N};
+		const int64 PoseShape[2] = {N, PoseDim};
+		TArray<FManipleTensor> Extra;
+		Extra.Add(FManipleTensor::MakeFloat(TEXT("time"), Flat, RecordedTime));
+		Extra.Add(FManipleTensor::MakeUInt8(TEXT("kind"), Flat, RecordedKind));
+		Extra.Add(FManipleTensor::MakeFloat(TEXT("pose"), PoseShape, RecordedPose));
+		Recorder->Write(Recorded, Extra);
+		Recorded.Reset();
+		RecordedTime.Reset();
+		RecordedKind.Reset();
+		RecordedPose.Reset();
+	}
+	if (Transitions.Num() == 0 || !Config.IsTraining())
 		return;
 
 	WinRows += Transitions.Num();
@@ -438,41 +516,78 @@ void UManipleBotSubsystem::Decide()
 	if (Config.IsTraining() && !bRegistered)
 		return;
 
-	// curriculum placement for bots starting a life / episode
+	// skip a tick if the previous one has not answered yet (server stalled): agents keep their last action
+	if (ActInFlight > 0)
+		return;
+
+	const float Period = 1.f / Config.DecisionHz;
+	// transitions are opened and closed when someone consumes them: the trainer or the recorder
+	const bool bCollect = Config.IsTraining() || Recorder.IsValid();
+
+	// curriculum placement for driven bots starting a life / episode
 	const FManipleStage* StageDef = CurrentStage();
 	if (StageDef && (StageDef->Spawn != FManipleStage::ESpawn::Lyra || Stage > 0))
 	{
 		for (const TWeakObjectPtr<UManipleAgentComponent>& W : Agents)
 		{
-			if (W.IsValid() && W->IsReady() && !W->bPlaced)
+			if (W.IsValid() && W->IsReady() && !W->bPlaced && !W->IsObserver() && W->Kind != EManipleAgentKind::Replay)
 				PlaceAgent(*W);
 		}
 	}
 
-	AccumulateScoreTime(1.f / Config.DecisionHz);
+	AccumulateScoreTime(Period);
 
-	TArray<UManipleAgentComponent*> Ready;
-	TArray<float> Obs;
+	// fresh observations for everyone: the dense shaping is the outcome of the previous action and belongs to that
+	// transition. Local brains (heuristic, random, replay) and observers decide here; policy bots go into one act request.
+	TArray<UManipleAgentComponent*> Ready, Local;
+	TArray<float> Obs, LocalObs, Row;
 	for (const TWeakObjectPtr<UManipleAgentComponent>& W : Agents)
 	{
 		UManipleAgentComponent* A = W.Get();
 		if (!A || !A->IsReady())
 			continue;
-		if (Config.Brain == EManipleBrain::Random)
+		if (A->IsObserver())
 		{
+			A->FinishObservedAction(Period); // what the pawn did since the last decision = the pending transition's action
+			A->SyncAimFromController();
+			A->BuildObservation(Row);
+		}
+		else if (A->Kind == EManipleAgentKind::Replay)
+		{
+			A->BuildObservation(Row);
+			DriveReplay(*A);
+		}
+		else if (A->Kind == EManipleAgentKind::Random)
+		{
+			A->BuildObservation(Row);
 			A->SetRandomAction();
 		}
 		else if (Config.Brain == EManipleBrain::Heuristic || A->bHeuristic)
 		{
-			A->BuildObservation(Obs);
-			A->SetHeuristicAction(Obs);
+			A->BuildObservation(Row);
+			A->SetHeuristicAction(Row);
 		}
 		else
 		{
+			A->BuildObservation(Row);
+			Obs.Append(Row);
 			Ready.Add(A);
+			continue;
 		}
+		LocalObs.Append(Row);
+		Local.Add(A);
 	}
-	if (Config.Brain == EManipleBrain::Random || Config.Brain == EManipleBrain::Heuristic)
+	if (bCollect)
+	{
+		for (UManipleAgentComponent* A : Local)
+			A->AddShapingFromObservation();
+		for (UManipleAgentComponent* A : Ready)
+			A->AddShapingFromObservation();
+		FlushTransitions();
+		for (int32 i = 0; i < Local.Num(); ++i)
+			Local[i]->BeginTransition(TConstArrayView<float>(LocalObs).Slice(i * ObsDim, ObsDim), Local[i]->GetAction(), 0.f, 0);
+	}
+	if (Config.Brain != EManipleBrain::Triton)
 	{
 		WinTickLatencyMs.Add(0.0);
 		++WinTicks;
@@ -482,26 +597,10 @@ void UManipleBotSubsystem::Decide()
 	if (Ready.Num() == 0)
 		return;
 
-	// skip a tick if the previous one has not answered yet (server stalled): agents keep their last action
-	if (ActInFlight > 0)
-		return;
-
-	// fresh observations first: the dense shaping is the outcome of the previous action and belongs to that transition
-	TArray<float> Row;
-	Obs.Reset();
-	Obs.Reserve(Ready.Num() * ObsDim);
 	TArray<TWeakObjectPtr<UManipleAgentComponent>> Targets;
-	const bool bTrain = Config.IsTraining();
 	for (UManipleAgentComponent* A : Ready)
-	{
-		A->BuildObservation(Row);
-		Obs.Append(Row);
 		Targets.Add(A);
-		if (bTrain)
-			A->AddShapingFromObservation();
-	}
-	if (bTrain)
-		FlushTransitions();
+	const bool bTrain = bCollect;
 
 	++ActInFlight;
 	++WinRequests;
@@ -583,7 +682,7 @@ void UManipleBotSubsystem::OnDamageMessage(FGameplayTag Channel, const FLyraVerb
 	if (Dealer)
 	{
 		++Dealer->Hits;
-		if (!Dealer->bHeuristic)
+		if (Dealer->IsScored())
 			++WinHits;
 		const ULyraTeamSubsystem* Teams = GetWorld()->GetSubsystem<ULyraTeamSubsystem>();
 		const bool bFriendly = Teams && Teams->CompareTeams(Msg.Instigator.Get(), Msg.Target.Get()) == ELyraTeamComparison::OnSameTeam;
@@ -609,9 +708,9 @@ void UManipleBotSubsystem::OnEliminationMessage(FGameplayTag Channel, const FLyr
 	}
 	Killer->AddReward(RewardKill);
 	++Killer->Kills;
-	if (Killer->bHeuristic)
+	if (!Killer->IsScored())
 	{
-		++WinHeuristicKills;
+		++WinHeuristicKills; // an opponent or an observed player
 	}
 	else
 	{
@@ -619,6 +718,160 @@ void UManipleBotSubsystem::OnEliminationMessage(FGameplayTag Channel, const FLyr
 		if (IsFinalPlacement(*Killer))
 			++WinScore.Kills;
 	}
+}
+
+// ---------- recording ----------
+
+TSharedPtr<FJsonObject> UManipleBotSubsystem::RecordingMeta() const
+{
+	TSharedPtr<FJsonObject> M = MakeShared<FJsonObject>();
+	M->SetStringField(TEXT("game"), TEXT("lyra"));
+	M->SetStringField(TEXT("map"), GetWorld()->GetMapName());
+	M->SetStringField(TEXT("policy"), Config.Model);
+	M->SetStringField(TEXT("config"), Config.ToString());
+	M->SetNumberField(TEXT("decision_hz"), Config.DecisionHz);
+	M->SetNumberField(TEXT("episode_time_limit"), EpisodeTimeLimitSec);
+	M->SetStringField(TEXT("started"), FDateTime::Now().ToIso8601());
+
+	FManipleAgentSpec Spec;
+	Spec.ObsDim = ObsDim;
+	Spec.ActDim = ActDim;
+	TSharedPtr<FJsonObject> SpecJson;
+	if (FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(Spec.ToJson()), SpecJson) && SpecJson.IsValid())
+		M->SetObjectField(TEXT("spec"), SpecJson);
+
+	TSharedPtr<FJsonObject> Kinds = MakeShared<FJsonObject>();
+	for (uint8 K = 0; K <= (uint8)EManipleAgentKind::Random; ++K)
+		Kinds->SetStringField(FString::FromInt(K), ManipleAgentKindName((EManipleAgentKind)K));
+	M->SetObjectField(TEXT("kinds"), Kinds);
+
+	// what the columns mean: [offset, size] per observation field, index per action, names per pose entry
+	auto Range = [](int32 Offset, int32 Size)
+	{
+		TArray<TSharedPtr<FJsonValue>> V;
+		V.Add(MakeShared<FJsonValueNumber>(Offset));
+		V.Add(MakeShared<FJsonValueNumber>(Size));
+		return V;
+	};
+	TSharedPtr<FJsonObject> ObsLayout = MakeShared<FJsonObject>();
+	ObsLayout->SetArrayField(TEXT("vel"), Range(ObsVel, 3));
+	ObsLayout->SetArrayField(TEXT("health"), Range(ObsHealth, 1));
+	ObsLayout->SetArrayField(TEXT("enemies"), Range(ObsEnemies, NumEnemies * EnemyStride));
+	ObsLayout->SetArrayField(TEXT("pitch"), Range(ObsPitch, 1));
+	ObsLayout->SetArrayField(TEXT("bias"), Range(ObsBias, 1));
+	ObsLayout->SetArrayField(TEXT("rays"), Range(ObsRays, NumRays));
+	TSharedPtr<FJsonObject> ActLayout = MakeShared<FJsonObject>();
+	ActLayout->SetNumberField(TEXT("move_fwd"), ActMoveFwd);
+	ActLayout->SetNumberField(TEXT("move_right"), ActMoveRight);
+	ActLayout->SetNumberField(TEXT("yaw_rate"), ActYawRate);
+	ActLayout->SetNumberField(TEXT("pitch_rate"), ActPitchRate);
+	ActLayout->SetNumberField(TEXT("fire"), ActFire);
+	TArray<TSharedPtr<FJsonValue>> PoseNames;
+	for (const TCHAR* Name : {TEXT("x"), TEXT("y"), TEXT("z"), TEXT("yaw"), TEXT("pitch")})
+		PoseNames.Add(MakeShared<FJsonValueString>(Name));
+	TSharedPtr<FJsonObject> Layout = MakeShared<FJsonObject>();
+	Layout->SetObjectField(TEXT("obs"), ObsLayout);
+	Layout->SetObjectField(TEXT("action"), ActLayout);
+	Layout->SetArrayField(TEXT("pose"), PoseNames);
+	Layout->SetNumberField(TEXT("enemy_stride"), EnemyStride);
+	M->SetObjectField(TEXT("layout"), Layout);
+
+	TSharedPtr<FJsonObject> Scales = MakeShared<FJsonObject>();
+	Scales->SetNumberField(TEXT("pos_cm"), PosScale);
+	Scales->SetNumberField(TEXT("vel_cm_s"), VelScale);
+	Scales->SetNumberField(TEXT("ray_cm"), RayRange);
+	Scales->SetNumberField(TEXT("yaw_deg_s"), MaxYawDegPerSec);
+	Scales->SetNumberField(TEXT("pitch_deg_s"), MaxPitchDegPerSec);
+	M->SetObjectField(TEXT("scales"), Scales);
+	return M;
+}
+
+void UManipleBotSubsystem::OpenRecorder()
+{
+	Recorder = MakeUnique<FManipleRecorder>();
+	if (!Recorder->Open(Config.RecordDir, RecordingMeta()))
+		Recorder.Reset();
+}
+
+// ---------- replay ----------
+
+bool UManipleBotSubsystem::LoadReplay()
+{
+	FString Error;
+	if (Config.ReplayDir.IsEmpty() || !Replay.Load(Config.ReplayDir, Error))
+	{
+		UE_LOG(LogManipleLyra, Error, TEXT("replay: %s"), Config.ReplayDir.IsEmpty() ? TEXT("-ManipleReplay=<dir> missing") : *Error);
+		return false;
+	}
+	const FManipleTensor* Action = Replay.Find(TEXT("action"));
+	const FManipleTensor* Pose = Replay.Find(TEXT("pose"));
+	const FManipleTensor* AgentIds = Replay.Find(TEXT("agent_id"));
+	if (!Action || !Pose || !AgentIds || !Replay.Find(TEXT("done")) || Action->Shape.Num() != 2 || Action->Shape[1] != ActDim ||
+		Pose->Shape.Num() != 2 || Pose->Shape[1] != PoseDim)
+	{
+		UE_LOG(LogManipleLyra, Error, TEXT("replay: %s has no Lyra action / pose / agent_id / done columns"), *Config.ReplayDir);
+		return false;
+	}
+	const TConstArrayView<int64> Ids = AgentIds->AsInt64s();
+	int32 Episodes = 0;
+	const uint8* Done = Replay.Find(TEXT("done"))->Data.GetData();
+	for (int64 Row = 0; Row < Replay.Rows; ++Row)
+	{
+		if (Ids[Row] != Config.ReplayAgent)
+			continue;
+		ReplayRows.Add(Row);
+		Episodes += Done[Row] ? 1 : 0;
+	}
+	if (ReplayRows.Num() == 0)
+	{
+		UE_LOG(LogManipleLyra, Error, TEXT("replay: agent %d has no rows in %s"), Config.ReplayAgent, *Config.ReplayDir);
+		return false;
+	}
+	double Hz = 0.0;
+	if (Replay.Meta->TryGetNumberField(TEXT("decision_hz"), Hz) && Hz > 0.0)
+		Config.DecisionHz = (float)Hz;
+	UE_LOG(LogManipleLyra, Display, TEXT("replay: agent %d of %s: %d rows, %d closed episodes, %.0f Hz"), Config.ReplayAgent,
+		*Config.ReplayDir, ReplayRows.Num(), Episodes, Config.DecisionHz);
+	return true;
+}
+
+void UManipleBotSubsystem::DriveReplay(UManipleAgentComponent& A)
+{
+	if (bReplayDone)
+		return;
+	if (ReplayComponent.Get() != &A)
+	{
+		// a new pawn: the previous one died before its recorded episode ended, skip to the next recorded episode
+		if (ReplayComponent.IsValid() || ReplayCursor > 0)
+		{
+			const uint8* Done = Replay.Find(TEXT("done"))->Data.GetData();
+			while (!bReplayEpisodeStart && ReplayCursor < ReplayRows.Num())
+			{
+				bReplayEpisodeStart = Done[ReplayRows[ReplayCursor]] != 0;
+				++ReplayCursor;
+			}
+		}
+		ReplayComponent = &A;
+	}
+	if (ReplayCursor >= ReplayRows.Num())
+	{
+		bReplayDone = true;
+		RequestQuit(TEXT("replay done"));
+		return;
+	}
+	const int64 Row = ReplayRows[ReplayCursor++];
+	if (bReplayEpisodeStart)
+	{
+		const float* P = Replay.Find(TEXT("pose"))->AsFloats().GetData() + Row * PoseDim;
+		A.Place(FVector(P[0], P[1], P[2]), P[3], P[4]);
+		A.bPlaced = true;
+		bReplayEpisodeStart = false;
+		UE_LOG(LogManipleLyra, Verbose, TEXT("replay: row %lld starts an episode at (%.0f, %.0f, %.0f) yaw %.0f"), Row, P[0], P[1], P[2],
+			P[3]);
+	}
+	A.SetAction(TConstArrayView<float>(Replay.Find(TEXT("action"))->AsFloats()).Slice(Row * ActDim, ActDim));
+	if (Replay.Find(TEXT("done"))->Data[Row])
+		bReplayEpisodeStart = true;
 }
 
 // ---------- curriculum ----------
@@ -669,6 +922,8 @@ void UManipleBotSubsystem::AssignRole(UManipleAgentComponent& A) const
 		bHeuristic = Team > 1;
 	}
 	A.bHeuristic = bHeuristic && Config.Brain == EManipleBrain::Triton;
+	if (A.bHeuristic)
+		A.Kind = EManipleAgentKind::Heuristic;
 	A.bApproachShaping = S && S->bApproachShaping;
 }
 
@@ -830,6 +1085,8 @@ void UManipleBotSubsystem::LogStats()
 	}
 	const TCHAR* Mode = Config.Brain == EManipleBrain::Random ? TEXT("random")
 		: Config.Brain == EManipleBrain::Heuristic			  ? TEXT("heuristic")
+		: Config.Brain == EManipleBrain::Replay				  ? TEXT("replay")
+		: Config.Brain == EManipleBrain::None				  ? TEXT("record")
 		: Config.IsTraining()								  ? TEXT("train")
 															  : TEXT("infer");
 	const double Sec = FMath::Max(WinFrameSec, 1e-6);
@@ -888,7 +1145,7 @@ int32 UManipleBotSubsystem::PolicyTeamId() const
 		return INDEX_NONE;
 	for (const TWeakObjectPtr<UManipleAgentComponent>& W : Agents)
 	{
-		if (W.IsValid() && !W->bHeuristic)
+		if (W.IsValid() && W->IsScored())
 			return Teams->FindTeamFromObject(W->GetOwner());
 	}
 	return INDEX_NONE;
@@ -900,7 +1157,7 @@ void UManipleBotSubsystem::AccumulateScoreTime(float Seconds)
 	for (const TWeakObjectPtr<UManipleAgentComponent>& W : Agents)
 	{
 		const UManipleAgentComponent* A = W.Get();
-		if (!A || A->bHeuristic || !A->IsReady() || A->HasDamageImmunity())
+		if (!A || !A->IsScored() || !A->IsReady() || A->HasDamageImmunity())
 			continue;
 		bAnyDamageable = true;
 		if (IsFinalPlacement(*A))
@@ -920,7 +1177,7 @@ void UManipleBotSubsystem::SampleScore()
 		for (const TWeakObjectPtr<UManipleAgentComponent>& W : Agents)
 		{
 			const UManipleAgentComponent* A = W.Get();
-			if (!A || A->bHeuristic || !IsFinalPlacement(*A))
+			if (!A || !A->IsScored() || !IsFinalPlacement(*A))
 				continue;
 			ALyraPlayerState* PS = Cast<ALyraPlayerState>(A->GetPlayerState());
 			if (!PS)
@@ -987,7 +1244,7 @@ void UManipleBotSubsystem::UpdateEval(float DeltaTime)
 		for (const TWeakObjectPtr<UManipleAgentComponent>& W : Agents)
 		{
 			const UManipleAgentComponent* A = W.Get();
-			if (A && !A->bHeuristic && A->IsReady() && !A->HasDamageImmunity())
+			if (A && A->IsScored() && A->IsReady() && !A->HasDamageImmunity())
 			{
 				bEvalStarted = true;
 				break;
@@ -1013,11 +1270,13 @@ void UManipleBotSubsystem::FinishEval()
 
 	int32 PolicyAgents = 0;
 	for (const TWeakObjectPtr<UManipleAgentComponent>& W : Agents)
-		if (W.IsValid() && !W->bHeuristic)
+		if (W.IsValid() && W->IsScored())
 			++PolicyAgents;
 
 	const TCHAR* Mode = Config.Brain == EManipleBrain::Random ? TEXT("random")
 		: Config.Brain == EManipleBrain::Heuristic			  ? TEXT("heuristic")
+		: Config.Brain == EManipleBrain::Replay				  ? TEXT("replay")
+		: Config.Brain == EManipleBrain::None				  ? TEXT("record")
 		: Config.IsTraining()								  ? TEXT("train")
 															  : TEXT("infer");
 	const FManipleStage* S = CurrentStage();

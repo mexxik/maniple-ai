@@ -15,12 +15,17 @@ space becomes one action group, or one per dimension with --groups per-dim.
 """
 
 import argparse
+import os
+import sys
 import time
 
 import gymnasium as gym
 import numpy as np
 from envs import make_env, spec_actions, spec_inputs, to_env_action, to_inputs
 from triton_agent import TritonAgent
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "triton", "common"))
+from maniple.recording import RecordingWriter  # noqa: E402  (numpy only)
 
 
 def parse_args():
@@ -50,6 +55,11 @@ def parse_args():
     )
     parser.add_argument(
         "--resume", action="store_true", help="continue an existing policy with its stored spec"
+    )
+    parser.add_argument(
+        "--record",
+        default=None,
+        help="write every transition to this directory (tools/recording.py reads it)",
     )
 
     net = parser.add_argument_group("network (see triton/common/maniple/spec.py)")
@@ -140,53 +150,80 @@ def main():
     finished_returns = []
     started = time.time()
 
+    recorder = None
+    if args.record:
+        meta = {"game": args.env, "policy": args.name, "spec": spec, "kinds": {"0": "policy"}}
+        recorder = RecordingWriter(args.record, meta)
+        print(f"recording to {args.record}")
+
     obs, _ = envs.reset(seed=0)
 
-    for step in range(1, args.steps + 1):
-        inputs = to_inputs(obs, obs_space)
+    try:
+        for step in range(1, args.steps + 1):
+            inputs = to_inputs(obs, obs_space)
 
-        action, action_index, logp, served_version = agent.act(
-            inputs, explore=not args.no_explore, channel="latest"
-        )
-        next_obs, reward, terminated, truncated, _ = envs.step(to_env_action(action, action_index, act_space))
-        done = np.logical_or(terminated, truncated)
-
-        # the trainer learns from the shaped reward; the progress line below stays on the true one
-        shaped_reward = reward
-        if args.center_penalty:
-            position = next_obs.reshape(args.agents, -1)
-            shaped_reward = reward - center_penalty(position, args.center_penalty, x_threshold)
-
-        status = agent.observe(
-            inputs=inputs,
-            action=action,
-            reward=shaped_reward,
-            done=done,
-            agent_id=agent_ids,
-            episode_id=episode_ids,
-            policy_version=np.full(args.agents, served_version),
-            logp=logp,
-        )
-
-        # episode accounting
-        episode_returns += reward
-        for i in np.where(done)[0]:
-            finished_returns.append(float(episode_returns[i]))
-            episode_returns[i] = 0.0
-            episode_ids[i] += 1
-
-        obs = next_obs
-
-        if step % 100 == 0:
-            recent = finished_returns[-20:]
-            mean_return = np.mean(recent) if recent else float("nan")
-            elapsed = time.time() - started
-            print(
-                f"step {step:5d}  served v{served_version} trained v{status['version']}  "
-                f"updates {status['updates']}  buffered {status['buffered']:5d}  stale {status['dropped_stale']}  "
-                f"episodes {len(finished_returns):4d}  mean return(last 20) {mean_return:8.2f}  "
-                f"kl {status['stats'].get('kl', 0):.4f}  {step * args.agents / elapsed:6.0f} steps/s  {elapsed:5.0f}s"
+            action, action_index, logp, served_version = agent.act(
+                inputs, explore=not args.no_explore, channel="latest"
             )
+            next_obs, reward, terminated, truncated, _ = envs.step(
+                to_env_action(action, action_index, act_space)
+            )
+            done = np.logical_or(terminated, truncated)
+
+            # the trainer learns from the shaped reward; the progress line below stays on the true one
+            shaped_reward = reward
+            if args.center_penalty:
+                position = next_obs.reshape(args.agents, -1)
+                shaped_reward = reward - center_penalty(position, args.center_penalty, x_threshold)
+
+            status = agent.observe(
+                inputs=inputs,
+                action=action,
+                reward=shaped_reward,
+                done=done,
+                agent_id=agent_ids,
+                episode_id=episode_ids,
+                policy_version=np.full(args.agents, served_version),
+                logp=logp,
+            )
+            if recorder:
+                recorder.append(
+                    **inputs,
+                    action=action.astype(np.float32),
+                    reward=shaped_reward.astype(np.float32),
+                    done=done.astype(bool),
+                    logp=logp.astype(np.float32),
+                    policy_version=np.full(args.agents, served_version, dtype=np.int64),
+                    agent_id=agent_ids,
+                    episode_id=episode_ids.copy(),
+                    time=np.full(args.agents, time.time() - started, dtype=np.float32),
+                    kind=np.zeros(args.agents, dtype=np.uint8),
+                )
+
+            # episode accounting
+            episode_returns += reward
+            for i in np.where(done)[0]:
+                finished_returns.append(float(episode_returns[i]))
+                episode_returns[i] = 0.0
+                episode_ids[i] += 1
+
+            obs = next_obs
+
+            if step % 100 == 0:
+                recent = finished_returns[-20:]
+                mean_return = np.mean(recent) if recent else float("nan")
+                elapsed = time.time() - started
+                print(
+                    f"step {step:5d}  served v{served_version} trained v{status['version']}  "
+                    f"updates {status['updates']}  buffered {status['buffered']:5d}  stale {status['dropped_stale']}  "
+                    f"episodes {len(finished_returns):4d}  mean return(last 20) {mean_return:8.2f}  "
+                    f"kl {status['stats'].get('kl', 0):.4f}  {step * args.agents / elapsed:6.0f} steps/s  {elapsed:5.0f}s"
+                )
+
+    finally:
+        if recorder:
+            recorder.close()
+            print(f"recorded {recorder.rows} rows to {args.record}")
 
 
 if __name__ == "__main__":

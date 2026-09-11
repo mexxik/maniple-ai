@@ -40,7 +40,7 @@ plus the settings that are known to work.
 
 | script | purpose |
 |---|---|
-| `run.py` | train: register → loop { act on `latest`, env.step, observe }; `--help` lists network and PPO flags |
+| `run.py` | train: register → loop { act on `latest`, env.step, observe }; `--help` lists network and PPO flags; `--record <dir>` also writes every transition as a recording (`tools/recording.py info <dir>`) |
 | `play.py` | play a channel or version greedily; `--render human\|rgb\|none`, `--video`, `--report`, `--promote`, `--export` |
 | `triton_agent.py` | the client class both use (`register`, `act`, `observe`, `report`, `promote`, `export`, `status`) |
 | `envs.py` | environment ↔ spec glue: which input an observation space becomes, Atari preprocessing, action groups, `env.step` translation |

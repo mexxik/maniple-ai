@@ -43,6 +43,8 @@ A policy is described once, at `register`, by an `AgentSpec` (`common/maniple/sp
     docker compose exec triton python -m unittest discover -s /common/tests -v
 
 Spec parsing, networks, buffer, one PPO update, ONNX export and the v1 checkpoint migration; no game needed.
+`test_recording.py` covers the recording format (`maniple/recording.py`: reader, writer, `.npy` columns) and runs on the
+host too, numpy is enough: `cd triton/common && python -m unittest tests.test_recording`.
 
 ## Gotchas
 - `common/` is mounted at `/common`; Triton only reloads a model when files under its own directory change, so after

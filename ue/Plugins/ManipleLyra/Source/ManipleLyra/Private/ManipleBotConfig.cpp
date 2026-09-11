@@ -1,6 +1,29 @@
 #include "ManipleBotConfig.h"
+#include "Misc/App.h"
 #include "Misc/CommandLine.h"
+#include "Misc/DateTime.h"
 #include "Misc/Parse.h"
+#include "Misc/Paths.h"
+
+const TCHAR* ManipleAgentKindName(EManipleAgentKind Kind)
+{
+	switch (Kind)
+	{
+	case EManipleAgentKind::Policy:
+		return TEXT("policy");
+	case EManipleAgentKind::Heuristic:
+		return TEXT("heuristic");
+	case EManipleAgentKind::Lyra:
+		return TEXT("lyra");
+	case EManipleAgentKind::Human:
+		return TEXT("human");
+	case EManipleAgentKind::Replay:
+		return TEXT("replay");
+	case EManipleAgentKind::Random:
+		return TEXT("random");
+	}
+	return TEXT("?");
+}
 
 FManipleBotConfig FManipleBotConfig::FromCommandLine()
 {
@@ -17,6 +40,8 @@ FManipleBotConfig FManipleBotConfig::FromCommandLine()
 			C.Brain = EManipleBrain::Heuristic;
 		else if (Brain.Equals(TEXT("triton"), ESearchCase::IgnoreCase))
 			C.Brain = EManipleBrain::Triton;
+		else if (Brain.Equals(TEXT("replay"), ESearchCase::IgnoreCase))
+			C.Brain = EManipleBrain::Replay;
 		else
 			C.Brain = EManipleBrain::None;
 	}
@@ -122,6 +147,42 @@ FManipleBotConfig FManipleBotConfig::FromCommandLine()
 	if (FParse::Value(Cmd, TEXT("ManipleEvalReport="), EvalReport))
 		C.bEvalReport = EvalReport != 0;
 
+	// ---- recording and replay ----
+	if (FParse::Value(Cmd, TEXT("ManipleRecord="), C.RecordDir) || FParse::Param(Cmd, TEXT("ManipleRecord")))
+	{
+		if (C.RecordDir.IsEmpty() || C.RecordDir == TEXT("1"))
+			C.RecordDir = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("Maniple"), TEXT("recordings"),
+				C.Model + TEXT("-") + FDateTime::Now().ToString(TEXT("%Y%m%d-%H%M%S")));
+		C.RecordDir = FPaths::ConvertRelativePathToFull(C.RecordDir);
+	}
+	FString Who;
+	if (!FApp::CanEverRender())
+		C.RecordKinds &= ~(1 << (uint8)EManipleAgentKind::Human); // headless: the local player is an idle pawn, not a human
+	if (FParse::Value(Cmd, TEXT("ManipleRecordWho="), Who) && !Who.Equals(TEXT("all"), ESearchCase::IgnoreCase))
+	{
+		C.RecordKinds = 0;
+		TArray<FString> Parts;
+		Who.ParseIntoArray(Parts, TEXT(","));
+		for (const FString& P : Parts)
+		{
+			for (uint8 K = 0; K <= (uint8)EManipleAgentKind::Random; ++K)
+			{
+				if (P.Equals(ManipleAgentKindName((EManipleAgentKind)K), ESearchCase::IgnoreCase))
+					C.RecordKinds |= 1 << K;
+			}
+		}
+	}
+	FString Replay;
+	if (FParse::Value(Cmd, TEXT("ManipleReplay="), Replay))
+	{
+		FString AgentStr;
+		if (Replay.Split(TEXT(":"), &C.ReplayDir, &AgentStr, ESearchCase::CaseSensitive, ESearchDir::FromEnd) && AgentStr.IsNumeric())
+			C.ReplayAgent = FCString::Atoi(*AgentStr);
+		else
+			C.ReplayDir = Replay;
+		C.ReplayDir = FPaths::ConvertRelativePathToFull(C.ReplayDir);
+	}
+
 	return C;
 }
 
@@ -160,6 +221,7 @@ FString FManipleBotConfig::ToString() const
 	const TCHAR* BrainStr = Brain == EManipleBrain::Random ? TEXT("random")
 		: Brain == EManipleBrain::Heuristic				   ? TEXT("heuristic")
 		: Brain == EManipleBrain::Triton				   ? TEXT("triton")
+		: Brain == EManipleBrain::Replay				   ? TEXT("replay")
 														   : TEXT("none");
 	const TCHAR* ModeStr = Mode == EManipleMode::Train ? TEXT("train") : TEXT("infer");
 
@@ -173,8 +235,9 @@ FString FManipleBotConfig::ToString() const
 	return FString::Printf(
 		TEXT("brain=%s mode=%s model=%s url=%s channel=%s explore=%d bots=%s hz=%.0f spawn=%d net=%s hidden=[%s] "
 			 "activation=%s layernorm=%d entropy=%.3f logstd=%.2f timescale=%.1f spectate=%d curriculum=%s opponents=%s endless=%d sync=%d "
-			 "score=%s eval=%.0f eval_report=%d"),
+			 "score=%s eval=%.0f eval_report=%d record=%s record_who=0x%02x replay=%s replay_agent=%d"),
 		BrainStr, ModeStr, *Model, *TritonUrl, *Channel, bExplore ? 1 : 0, MaxBots < 0 ? TEXT("all") : *FString::FromInt(MaxBots),
 		DecisionHz, SpawnBots, *NetPreset, *HiddenStr, *Activation, bLayerNorm ? 1 : 0, EntropyCoef, LogStdInit, TimeScale,
-		bSpectate ? 1 : 0, *CurriculumStr, OppStr, bEndless ? 1 : 0, bSyncAct ? 1 : 0, *ScoreToString(), EvalSeconds, bEvalReport ? 1 : 0);
+		bSpectate ? 1 : 0, *CurriculumStr, OppStr, bEndless ? 1 : 0, bSyncAct ? 1 : 0, *ScoreToString(), EvalSeconds, bEvalReport ? 1 : 0,
+		RecordDir.IsEmpty() ? TEXT("off") : *RecordDir, RecordKinds, ReplayDir.IsEmpty() ? TEXT("off") : *ReplayDir, ReplayAgent);
 }

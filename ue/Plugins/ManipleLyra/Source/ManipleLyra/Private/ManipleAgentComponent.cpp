@@ -27,9 +27,10 @@ UManipleAgentComponent::UManipleAgentComponent()
 	PrimaryComponentTick.TickGroup = TG_PrePhysics;
 }
 
-void UManipleAgentComponent::Init(int32 InAgentId, UManipleBotSubsystem* InSubsystem)
+void UManipleAgentComponent::Init(int32 InAgentId, EManipleAgentKind InKind, UManipleBotSubsystem* InSubsystem)
 {
 	AgentId = InAgentId;
+	Kind = InKind;
 	Subsystem = InSubsystem;
 }
 
@@ -39,18 +40,28 @@ void UManipleAgentComponent::BeginPlay()
 {
 	Super::BeginPlay();
 	Character = Cast<ALyraCharacter>(GetOwner());
-	AI = Character.IsValid() ? Cast<AAIController>(Character->GetController()) : nullptr;
-	if (!Character.IsValid() || !AI.IsValid())
+	Controller = Character.IsValid() ? Character->GetController() : nullptr;
+	AI = IsObserver() ? nullptr : Cast<AAIController>(Controller.Get());
+	if (!Character.IsValid() || !Controller.IsValid() || (!IsObserver() && !AI.IsValid()))
 	{
-		UE_LOG(LogManipleLyra, Warning, TEXT("agent %d: owner is not an AI-controlled LyraCharacter, disabling"), AgentId);
+		UE_LOG(LogManipleLyra, Warning, TEXT("agent %d (%s): owner is not a %s LyraCharacter, disabling"), AgentId,
+			ManipleAgentKindName(Kind), IsObserver() ? TEXT("possessed") : TEXT("AI-controlled"));
 		SetComponentTickEnabled(false);
 		return;
 	}
-	TakeOverFromBehaviorTree();
-	Aim = FRotator(0.f, AI->GetControlRotation().Yaw, 0.f);
+	if (IsObserver())
+	{
+		SyncAimFromController();
+	}
+	else
+	{
+		TakeOverFromBehaviorTree();
+		Aim = FRotator(0.f, AI->GetControlRotation().Yaw, 0.f);
+	}
 	if (ULyraHealthComponent* H = ULyraHealthComponent::FindHealthComponent(Character.Get()))
 		H->OnDeathStarted.AddDynamic(this, &UManipleAgentComponent::OnDeathStarted);
-	UE_LOG(LogManipleLyra, Verbose, TEXT("agent %d: took over %s (%s)"), AgentId, *Character->GetName(), *AI->GetName());
+	UE_LOG(LogManipleLyra, Verbose, TEXT("agent %d (%s): %s %s (%s)"), AgentId, ManipleAgentKindName(Kind),
+		IsObserver() ? TEXT("observing") : TEXT("took over"), *Character->GetName(), *Controller->GetName());
 }
 
 void UManipleAgentComponent::EndPlay(const EEndPlayReason::Type Reason)
@@ -95,8 +106,10 @@ void UManipleAgentComponent::TakeOverFromBehaviorTree()
 
 bool UManipleAgentComponent::IsReady() const
 {
-	if (bDead || !Character.IsValid() || !AI.IsValid())
+	if (bDead || !Character.IsValid() || !Controller.IsValid() || (!IsObserver() && !AI.IsValid()))
 		return false;
+	if (Controller->GetPawn() != Character.Get())
+		return false; // unpossessed (a player switching pawns, a bot being respawned)
 	const ULyraHealthComponent* H = ULyraHealthComponent::FindHealthComponent(Character.Get());
 	return H && !H->IsDeadOrDying();
 }
@@ -130,8 +143,8 @@ bool UManipleAgentComponent::HasDamageImmunity() const
 
 APlayerState* UManipleAgentComponent::GetPlayerState() const
 {
-	if (AI.IsValid() && AI->PlayerState)
-		return AI->PlayerState;
+	if (Controller.IsValid() && Controller->PlayerState)
+		return Controller->PlayerState;
 	return Character.IsValid() ? Character->GetPlayerState() : nullptr;
 }
 
@@ -139,7 +152,7 @@ bool UManipleAgentComponent::Owns(const UObject* Obj) const
 {
 	if (!Obj)
 		return false;
-	return Obj == Character.Get() || Obj == AI.Get() || Obj == GetPlayerState();
+	return Obj == Character.Get() || Obj == Controller.Get() || Obj == GetPlayerState();
 }
 
 // ---------- observation ----------
@@ -257,7 +270,7 @@ void UManipleAgentComponent::SetRandomAction()
 UObject* UManipleAgentComponent::GetActiveWeaponItem() const
 {
 	static UClass* QuickBarClass = FindObject<UClass>(nullptr, TEXT("/Script/LyraGame.LyraQuickBarComponent"));
-	UActorComponent* QuickBar = (AI.IsValid() && QuickBarClass) ? AI->GetComponentByClass(QuickBarClass) : nullptr;
+	UActorComponent* QuickBar = (Controller.IsValid() && QuickBarClass) ? Controller->GetComponentByClass(QuickBarClass) : nullptr;
 	UFunction* Fn = QuickBar ? QuickBar->FindFunction(TEXT("GetActiveSlotItem")) : nullptr;
 	if (!Fn)
 		return nullptr;
@@ -444,7 +457,7 @@ void UManipleAgentComponent::LogDryState(const TCHAR* Why) const
 	UObject* Item = GetActiveWeaponItem();
 	int32 Slot = -1;
 	static UClass* QuickBarClass = FindObject<UClass>(nullptr, TEXT("/Script/LyraGame.LyraQuickBarComponent"));
-	UActorComponent* QuickBar = (AI.IsValid() && QuickBarClass) ? AI->GetComponentByClass(QuickBarClass) : nullptr;
+	UActorComponent* QuickBar = (Controller.IsValid() && QuickBarClass) ? Controller->GetComponentByClass(QuickBarClass) : nullptr;
 	if (UFunction* Fn = QuickBar ? QuickBar->FindFunction(TEXT("GetActiveSlotIndex")) : nullptr)
 	{
 		struct
@@ -606,8 +619,83 @@ void UManipleAgentComponent::TickComponent(float DeltaTime, ELevelTick TickType,
 	if (!IsReady())
 		return;
 	EpisodeTime += DeltaTime;
-	if (bHasAction)
+	if (IsObserver())
+		SampleObserved(DeltaTime);
+	else if (bHasAction)
 		ApplyAction(DeltaTime);
+}
+
+// ---------- observers: the action is read off the pawn ----------
+
+bool UManipleAgentComponent::IsFireAbilityActive() const
+{
+	const ULyraAbilitySystemComponent* ASC = Character.IsValid() ? Character->GetLyraAbilitySystemComponent() : nullptr;
+	if (!ASC)
+		return false;
+	static const FGameplayTag FireTag = FGameplayTag::RequestGameplayTag(TEXT("InputTag.Weapon.Fire"));
+	static const FGameplayTag FireAutoTag = FGameplayTag::RequestGameplayTag(TEXT("InputTag.Weapon.FireAuto"));
+	for (const FGameplayAbilitySpec& Spec : ASC->GetActivatableAbilities())
+	{
+		const FGameplayTagContainer& Src = Spec.GetDynamicSpecSourceTags();
+		if ((Src.HasTagExact(FireTag) || Src.HasTagExact(FireAutoTag)) && Spec.IsActive())
+			return true;
+	}
+	return false;
+}
+
+void UManipleAgentComponent::SampleObserved(float DeltaTime)
+{
+	// movement: the pawn's velocity in its own view frame, later divided by the max speed = the move input that caused it
+	const FRotator Frame(0.f, Controller->GetControlRotation().Yaw, 0.f);
+	ObservedVelSum += Frame.UnrotateVector(Character->GetVelocity());
+	++ObservedFrames;
+	if (const UCharacterMovementComponent* Move = Character->GetCharacterMovement())
+		ObservedMaxSpeed = FMath::Max(ObservedMaxSpeed, Move->GetMaxSpeed());
+
+	// fire: the fire ability is running (immediate), or a round left the magazine (the fallback, one frame late)
+	UObject* Item = GetActiveWeaponItem();
+	const int32 Magazine = GetMagazineAmmo(Item);
+	const bool bShotThisFrame = Magazine >= 0 && LastMagazine > Magazine;
+	LastMagazine = Magazine;
+	if (bShotThisFrame)
+	{
+		++Shots;
+		if (Subsystem.IsValid())
+			Subsystem->OnAgentShot(*this);
+	}
+	if (bShotThisFrame || IsFireAbilityActive())
+		bObservedFire = true;
+}
+
+void UManipleAgentComponent::SyncAimFromController()
+{
+	if (!Controller.IsValid())
+		return;
+	const FRotator R = Controller->GetControlRotation();
+	Aim = FRotator(FRotator::NormalizeAxis(R.Pitch), FRotator::NormalizeAxis(R.Yaw), 0.f);
+}
+
+void UManipleAgentComponent::FinishObservedAction(float Period)
+{
+	if (bHasTransition && Controller.IsValid() && TransAction.Num() == ActDim)
+	{
+		const FRotator Now = Controller->GetControlRotation();
+		const float DeltaYaw = FRotator::NormalizeAxis(Now.Yaw - ObservedStartRot.Yaw);
+		const float DeltaPitch = FRotator::NormalizeAxis(Now.Pitch - ObservedStartRot.Pitch);
+		const FVector Vel = ObservedFrames > 0 ? ObservedVelSum / ObservedFrames : FVector::ZeroVector;
+		const float MaxSpeed = FMath::Max(ObservedMaxSpeed, 1.f);
+		const float Dt = FMath::Max(Period, 1e-3f);
+		TransAction[ActMoveFwd] = FMath::Clamp(Vel.X / MaxSpeed, -1.f, 1.f);
+		TransAction[ActMoveRight] = FMath::Clamp(Vel.Y / MaxSpeed, -1.f, 1.f);
+		TransAction[ActYawRate] = FMath::Clamp(DeltaYaw / Dt / MaxYawDegPerSec, -1.f, 1.f);
+		TransAction[ActPitchRate] = FMath::Clamp(DeltaPitch / Dt / MaxPitchDegPerSec, -1.f, 1.f);
+		TransAction[ActFire] = bObservedFire ? 1.f : -1.f;
+	}
+	ObservedStartRot = Controller.IsValid() ? Controller->GetControlRotation() : FRotator::ZeroRotator;
+	ObservedVelSum = FVector::ZeroVector;
+	ObservedMaxSpeed = 0.f;
+	ObservedFrames = 0;
+	bObservedFire = false;
 }
 
 // ---------- transitions ----------
@@ -618,6 +706,13 @@ void UManipleAgentComponent::BeginTransition(TConstArrayView<float> Obs, TConstA
 	TransAction = TArray<float>(InAction.GetData(), InAction.Num());
 	TransLogP = LogP;
 	TransVersion = PolicyVersion;
+	TransTime = GetWorld() ? (float)GetWorld()->GetTimeSeconds() : 0.f;
+	const FVector Loc = Character.IsValid() ? Character->GetActorLocation() : FVector::ZeroVector;
+	TransPose[0] = Loc.X;
+	TransPose[1] = Loc.Y;
+	TransPose[2] = Loc.Z;
+	TransPose[3] = Aim.Yaw;
+	TransPose[4] = Aim.Pitch;
 	bHasTransition = true;
 	AddReward(RewardStep);
 }
@@ -657,19 +752,19 @@ void UManipleAgentComponent::FlushTransition(bool bDone)
 		EpisodeReturn = 0.f;
 		EpisodeTime = 0.f;
 		PrevNearestDist = -1.f;
-		if (!bDead)
+		if (!bDead && !IsObserver())
 			RefillAmmo();
 	}
 }
 
 // ---------- curriculum placement ----------
 
-void UManipleAgentComponent::Place(const FVector& Location, float Yaw)
+void UManipleAgentComponent::Place(const FVector& Location, float Yaw, float Pitch)
 {
 	if (!Character.IsValid())
 		return;
 	Character->TeleportTo(Location, FRotator(0.f, Yaw, 0.f));
-	Aim = FRotator(0.f, Yaw, 0.f);
+	Aim = FRotator(Pitch, Yaw, 0.f);
 	if (AI.IsValid())
 		AI->SetControlRotation(Aim);
 	PrevNearestDist = -1.f;

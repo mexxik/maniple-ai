@@ -2,18 +2,26 @@
 
 #include "CoreMinimal.h"
 #include "Components/ActorComponent.h"
+#include "ManipleBotConfig.h"
 #include "ManipleLyraSchema.h"
 #include "ManipleAgentComponent.generated.h"
 
 class ALyraCharacter;
+class AController;
 class AAIController;
 class APlayerState;
 class UManipleBotSubsystem;
 
 /**
- * Actuator + sensor for one Lyra bot pawn. Stops the behaviour tree, builds observations on request,
- * applies the latest action every frame, and accumulates reward between decisions. Decisions are driven
- * by UManipleBotSubsystem. One component = one episode: it lives with the pawn, death ends the episode.
+ * Actuator + sensor for one Lyra pawn. Decisions are driven by UManipleBotSubsystem. One component = one episode:
+ * it lives with the pawn, death ends the episode.
+ *
+ * Two roles, fixed by Kind:
+ *   driven    (policy, heuristic, random, replay): stops the behaviour tree, builds observations on request, applies
+ *             the latest action every frame, accumulates reward between decisions.
+ *   observer  (lyra, human): leaves the controller alone (a behaviour tree or a player), builds the same observations
+ *             and derives the action from what the pawn did between two decisions (movement from velocity, look from
+ *             the control rotation, fire from the fire ability / magazine), so a recording of it reads like a policy's.
  */
 UCLASS()
 class MANIPLELYRA_API UManipleAgentComponent : public UActorComponent
@@ -23,8 +31,12 @@ class MANIPLELYRA_API UManipleAgentComponent : public UActorComponent
 public:
 	UManipleAgentComponent();
 
-	void Init(int32 InAgentId, UManipleBotSubsystem* InSubsystem);
+	void Init(int32 InAgentId, EManipleAgentKind InKind, UManipleBotSubsystem* InSubsystem);
 	int32 GetAgentId() const { return AgentId; }
+	EManipleAgentKind Kind = EManipleAgentKind::Policy;
+	bool IsObserver() const { return Kind == EManipleAgentKind::Lyra || Kind == EManipleAgentKind::Human; }
+	/** Counts for the score and the stats: a bot this run is about (not an opponent, not something we only watch). */
+	bool IsScored() const { return !bHeuristic && !IsObserver(); }
 
 	virtual void BeginPlay() override;
 	virtual void EndPlay(const EEndPlayReason::Type Reason) override;
@@ -44,8 +56,8 @@ public:
 	/** True while Lyra's warmup immunity (or any other) protects the pawn: nothing scores yet. */
 	bool HasDamageImmunity() const;
 
-	/** Teleport for curriculum placement; faces Yaw. */
-	void Place(const FVector& Location, float Yaw);
+	/** Teleport for curriculum placement / replay; faces Yaw (and Pitch). */
+	void Place(const FVector& Location, float Yaw, float Pitch = 0.f);
 	void FaceTowards(const FVector& Target);
 	float GetNearestEnemyDistance() const { return LastNearestDist; }
 	void BuildObservation(TArray<float>& Obs) const;
@@ -53,6 +65,14 @@ public:
 	void SetRandomAction();
 	/** Turn towards the nearest visible enemy in Obs (built by BuildObservation) and fire when aligned. */
 	void SetHeuristicAction(TConstArrayView<float> Obs);
+	TConstArrayView<float> GetAction() const { return TConstArrayView<float>(Action, ManipleLyra::ActDim); }
+
+	// ---- observers ----
+
+	/** The controller's view becomes the frame of the next observation (driven agents keep their own Aim). */
+	void SyncAimFromController();
+	/** Turns what the pawn did since the last decision into the action of the pending transition. Period = decision period. */
+	void FinishObservedAction(float Period);
 
 	// ---- training: transitions ----
 
@@ -63,6 +83,9 @@ public:
 	bool HasTransition() const { return bHasTransition; }
 	/** Hands the pending transition to the subsystem batch (done = episode over) and resets the reward accumulator. */
 	void FlushTransition(bool bDone);
+	/** Game time and pose (x, y, z, yaw, pitch) at the pending transition's observation, for the recorder. */
+	float GetTransitionTime() const { return TransTime; }
+	TConstArrayView<float> GetTransitionPose() const { return TConstArrayView<float>(TransPose, ManipleLyra::PoseDim); }
 
 	void AddReward(float R) { RewardAccum += R; }
 	float GetEpisodeReturn() const { return EpisodeReturn; }
@@ -77,6 +100,8 @@ public:
 private:
 	void TakeOverFromBehaviorTree();
 	void ApplyAction(float DeltaTime);
+	void SampleObserved(float DeltaTime); // observers, every frame
+	bool IsFireAbilityActive() const;
 
 	UFUNCTION()
 	void OnDeathStarted(AActor* OwningActor);
@@ -94,7 +119,8 @@ private:
 	int32 AgentId = -1;
 	TWeakObjectPtr<UManipleBotSubsystem> Subsystem;
 	TWeakObjectPtr<ALyraCharacter> Character;
-	TWeakObjectPtr<AAIController> AI;
+	TWeakObjectPtr<AController> Controller; // whoever possesses the pawn (AI or player)
+	TWeakObjectPtr<AAIController> AI; // set for driven agents only
 	float Action[ManipleLyra::ActDim] = {};
 	FRotator Aim = FRotator::ZeroRotator; // our view rotation; pushed to the controller every frame (the AI controller resets pitch)
 	bool bHasAction = false;
@@ -114,12 +140,21 @@ private:
 	float DebugTimer = 0.f;
 	bool bDebugLogged = false;
 
+	// observer sampling since the last decision
+	FRotator ObservedStartRot = FRotator::ZeroRotator;
+	FVector ObservedVelSum = FVector::ZeroVector; // in the yaw frame
+	float ObservedMaxSpeed = 0.f;
+	int32 ObservedFrames = 0;
+	bool bObservedFire = false;
+
 	// pending transition
 	bool bHasTransition = false;
 	TArray<float> TransObs;
 	TArray<float> TransAction;
 	float TransLogP = 0.f;
 	int64 TransVersion = 0;
+	float TransTime = 0.f;
+	float TransPose[ManipleLyra::PoseDim] = {};
 	float RewardAccum = 0.f;
 	float EpisodeReturn = 0.f;
 	float EpisodeTime = 0.f;
