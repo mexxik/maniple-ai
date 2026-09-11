@@ -1,6 +1,9 @@
 # ppo_train: the ALGORITHM. Owns named policies, serves the 'latest' channel from its current weights
 # (command=act), collects transitions (command=observe), trains in the background, and exports static
 # 'policy_<name>' models only on events (score improvement, command=export, promote).
+#
+# Observation inputs (obs, frame, audio, text) are all optional on the wire: a policy sends the ones its spec
+# declares. Rows are agent steps; every input has the same number of rows.
 name: "ppo_train"
 backend: "python"
 max_batch_size: 0            # rows are the batch dim inside each tensor; shapes vary per policy
@@ -9,9 +12,12 @@ input [
   { name: "name",           data_type: TYPE_STRING, dims: [ 1 ] },
   { name: "command",        data_type: TYPE_STRING, dims: [ 1 ],  optional: true },   # register | act | observe | status | export | report | promote
   { name: "spec",           data_type: TYPE_STRING, dims: [ 1 ],  optional: true },   # JSON AgentSpec (register)
-  { name: "obs",            data_type: TYPE_FP32,   dims: [ -1, -1 ], optional: true },
+  { name: "obs",            data_type: TYPE_FP32,   dims: [ -1, -1 ], optional: true },           # [N, D] vector
+  { name: "frame",          data_type: TYPE_UINT8,  dims: [ -1, -1, -1, -1 ], optional: true },   # [N, H, W, C] image
+  { name: "audio",          data_type: TYPE_FP32,   dims: [ -1, -1 ], optional: true },           # [N, S] samples
+  { name: "text",           data_type: TYPE_STRING, dims: [ -1 ], optional: true },               # [N] lines
   { name: "explore",        data_type: TYPE_BOOL,   dims: [ 1 ],  optional: true },   # act
-  { name: "action",         data_type: TYPE_FP32,   dims: [ -1, -1 ], optional: true },
+  { name: "action",         data_type: TYPE_FP32,   dims: [ -1, -1 ], optional: true },   # [N, action_dim] flat row
   { name: "reward",         data_type: TYPE_FP32,   dims: [ -1 ], optional: true },
   { name: "done",           data_type: TYPE_BOOL,   dims: [ -1 ], optional: true },
   { name: "agent_id",       data_type: TYPE_INT64,  dims: [ -1 ], optional: true },
@@ -24,8 +30,8 @@ input [
 ]
 output [
   { name: "status",         data_type: TYPE_STRING, dims: [ 1 ] },       # JSON, always
-  { name: "action",         data_type: TYPE_FP32,   dims: [ -1, -1 ] },  # act
-  { name: "action_index",   data_type: TYPE_INT64,  dims: [ -1 ] },      # act
+  { name: "action",         data_type: TYPE_FP32,   dims: [ -1, -1 ] },  # act: [N, action_dim]
+  { name: "action_index",   data_type: TYPE_INT64,  dims: [ -1, -1 ] },  # act: [N, discrete groups]
   { name: "logp",           data_type: TYPE_FP32,   dims: [ -1 ] },      # act
   { name: "policy_version", data_type: TYPE_INT64,  dims: [ 1 ] }        # act
 ]

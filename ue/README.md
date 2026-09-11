@@ -14,13 +14,19 @@ The gRPC library and Triton protos are prebuilt into `ManipleInference/Source/Th
 
 - `FManipleTritonClient` — one persistent bidirectional `ModelStreamInfer` stream per client, requests matched
   by id, reconnects on failure, completions delivered on the game thread. Raw tensors in `FManipleTensor`
-  (FP32, INT64, BOOL, BYTES helpers).
+  (FP32, INT64, BOOL, UINT8, BYTES helpers).
 - `FManipleAgentClient` — the C++ twin of `gym/triton_agent.py`: one named policy on one server.
-  `Register(spec)`, `Act(obs, rows, explore, channel)`, `Observe(transitions)`, `Status()`, `Report`,
-  `Promote`, `Export`. Channel `latest` goes to the trainer (`ppo_train`, the weights being trained);
-  `best`, `stable` or a version number go to `ppo_infer` (exported ONNX / TensorRT).
-- `FManipleAgentSpec` — obs dim, action space, network preset, PPO overrides; serialised to the same JSON
-  the gym scripts send.
+  `Register(spec)`, `Act(...)`, `Observe(transitions)`, `Status()`, `Report`, `Promote`, `Export`.
+  Channel `latest` goes to the trainer (`ppo_train`, the weights being trained); `best`, `stable` or a
+  version number go to `ppo_infer` (exported ONNX / TensorRT).
+- `FManipleAgentSpec` — what the policy takes and returns, plus network preset and PPO overrides; serialised
+  to the same JSON the gym scripts send. Two forms: the v1 shorthand (`ObsDim` + `ActDim`/`DiscreteN`: one
+  vector in, one action group out, what `ManipleLyra` uses) and named `Inputs` (`obs` vector, `frame`
+  image [H, W, C] uint8, ...) with named `Actions` (continuous or discrete groups).
+- Observations travel as named tensors. `Act(obs, rows, obsDim, ...)` sends one vector; `Act(inputs, rows, ...)`
+  sends any set of `FManipleTensor`s shaped `[rows, ...]`. `FManipleTransitionBatch::Add` (vector) or `AddRow`
+  (named tensors) collect the transitions. Actions come back as one flat row per agent over all groups
+  (`FManipleActResult::Row`), with the chosen index per discrete group (`Index(row, group)`).
 - `FManipleBatchInferer` — generic client-side batching for plain models (obs in, action out).
 
 Tests (`Automation RunTests Maniple`, Triton must be up): `Maniple.Triton.Smoke` registers a throwaway policy

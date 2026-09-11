@@ -21,7 +21,7 @@ class Algorithm(ABC):
 
     @abstractmethod
     def actor(self) -> nn.Module:
-        """Inference network: obs -> action (mean or logits). This is what gets exported as ONNX."""
+        """Inference network: inputs -> flat action row (means / logits). This is what gets exported as ONNX."""
 
     @abstractmethod
     def update(self, trajectories: list[dict]) -> dict:

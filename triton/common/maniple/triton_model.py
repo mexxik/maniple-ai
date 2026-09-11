@@ -6,15 +6,17 @@ A concrete model is two lines:
     class TritonPythonModel(AlgorithmModel):
         algorithm = PPO
 
-Protocol (every request addresses ONE named policy; rows in the tensors are agent steps):
+Protocol (every request addresses ONE named policy; rows in the tensors are agent steps; INPUTS = the
+tensors the policy's spec declares: obs and/or frame, audio, text):
   command=register  spec=<json>                              create the policy (idempotent)
-  command=act       obs [explore]                            actions from the CURRENT weights ('latest' channel)
-  command=observe   obs action reward done [agent_id episode_id policy_version logp]   feed transitions
+  command=act       INPUTS [explore]                         actions from the CURRENT weights ('latest' channel)
+  command=observe   INPUTS action reward done [agent_id episode_id policy_version logp]   feed transitions
   command=status
   command=export                                             write the current version as a static model
   command=report    version score [episodes]                 a client's greedy evaluation of a version (drives 'best')
   command=promote   version                                  pin 'stable' (exports if needed, builds TensorRT if enabled)
-Outputs: status (JSON) always; action / action_index / logp / policy_version filled for command=act.
+Outputs: status (JSON) always; action [N, action_dim] / action_index [N, discrete groups] / logp [N] /
+policy_version filled for command=act.
 """
 
 from __future__ import annotations
@@ -27,24 +29,10 @@ import triton_python_backend_utils as pb_utils
 from .algorithms.base import Algorithm
 from .registry import PolicyRegistry
 from .spec import AgentSpec
-
-
-def _str(request, name):
-    t = pb_utils.get_input_tensor_by_name(request, name)
-    if t is None:
-        return None
-    v = t.as_numpy().reshape(-1)[0]
-    return v.decode() if isinstance(v, (bytes, np.bytes_)) else str(v)
-
-
-def _arr(request, name):
-    t = pb_utils.get_input_tensor_by_name(request, name)
-    return None if t is None else t.as_numpy()
-
-
-def _scalar(request, name, default=None):
-    a = _arr(request, name)
-    return default if a is None else a.reshape(-1)[0]
+from .wire import array_input as _arr
+from .wire import read_inputs
+from .wire import scalar_input as _scalar
+from .wire import string_input as _str
 
 
 class AlgorithmModel:
@@ -92,15 +80,14 @@ class AlgorithmModel:
             )
 
         if command == "act":
-            obs = _arr(req, "obs").astype(np.float32)
             explore = bool(_scalar(req, "explore", False))
-            action, index, logp = policy.act(obs, explore)
+            action, index, logp = policy.act(read_inputs(req), explore)
             status = {"ok": True, "policy": name, "channel": "latest", "explore": explore}
             return self._respond(status, action=action, index=index, logp=logp, version=policy.version)
 
         if command == "observe":
             n = policy.observe(
-                obs=_arr(req, "obs"),
+                inputs=read_inputs(req),
                 action=_arr(req, "action"),
                 reward=_arr(req, "reward"),
                 done=_arr(req, "done"),
@@ -136,7 +123,7 @@ class AlgorithmModel:
             output_tensors=[
                 pb_utils.Tensor("status", np.array([json.dumps(status).encode()], dtype=np.object_)),
                 pb_utils.Tensor("action", action if action is not None else np.zeros((0, 1), np.float32)),
-                pb_utils.Tensor("action_index", index if index is not None else np.zeros((n,), np.int64)),
+                pb_utils.Tensor("action_index", index if index is not None else np.zeros((n, 0), np.int64)),
                 pb_utils.Tensor("logp", logp if logp is not None else np.zeros((n,), np.float32)),
                 pb_utils.Tensor("policy_version", np.array([version], dtype=np.int64)),
             ]

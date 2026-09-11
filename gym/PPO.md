@@ -58,6 +58,26 @@ Return per episode is in [−1600, 0]; a good policy stays above −200. Continu
     DISPLAY=:0 .venv/bin/python play.py --env Pendulum-v1 --name pendulum2 --channel best --episodes 3 --promote
 
 
+Several heads on one environment (one continuous group per action dimension, the pipe's multi-group path):
+
+    .venv/bin/python run.py --env Pendulum-v1 --name pendulum_groups --groups per-dim --agents 16 --steps 30000 \
+  --rollout 4096 --lr 1e-3 --gamma 0.9 --entropy 0.0 --epochs 10
+
+## ALE/Pong-v5 (pixels: frame 84x84x4 uint8, 6 actions) — needs `gymnasium[atari]`
+
+The first policy that learns from an image. Reward is the point difference per episode, in [−21, 21];
+random play sits at −21, a policy that starts winning points is real learning. Atari preprocessing
+(4-frame skip, 84x84 grayscale, 4 frames stacked) is applied by `envs.py`. `--net none` puts the heads
+straight on the CNN's 512-wide layer (the Nature-DQN layout); `--async-envs` steps the games in worker
+processes so the client keeps up with the server.
+
+    .venv/bin/python run.py --env ALE/Pong-v5 --name pong --agents 16 --steps 60000 --async-envs \
+  --net none --activation relu --rollout 4096 --minibatch 256 --epochs 3 --lr 2.5e-4 --entropy 0.01
+    .venv/bin/python play.py --env ALE/Pong-v5 --name pong --channel latest --episodes 3 --render none --max-steps 5000
+    DISPLAY=:0 .venv/bin/python play.py --env ALE/Pong-v5 --name pong --channel latest --episodes 1 --max-steps 5000
+
+Yardstick from the plan: a positive point rate within about half an hour of wall time.
+
 ## LunarLander-v3 (discrete, 8 obs, 4 actions) — needs `gymnasium[box2d]`
 
 Solved at return 200 averaged over 100 episodes. Expect a few minutes.
@@ -88,6 +108,7 @@ Long-horizon locomotion; the first real test of network size and normalisation. 
 - `--rollout` is transitions per PPO update across all agents; bigger = steadier gradients, fewer versions.
 - `--agents` multiplies throughput; each step is one `act` and one `observe` call for the whole batch.
 - `--entropy` keeps exploration alive on sparse rewards; lower it for continuous control once learning starts.
-- `--net auto` sizes two layers from the observation size; use presets or `--hidden` for anything image-like.
+- `--net auto` sizes two torso layers from the encoder output; `--net none` drops the torso (pixels: the CNN's
+  fully connected layer already is one); use presets or `--hidden` for anything in between.
 - Observation normalisation is on by default (`--no-normalize-obs` to disable); it is baked into exports.
 - Nothing is exported while training unless the score improves; promote what you like from `latest`.

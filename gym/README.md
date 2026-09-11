@@ -8,6 +8,7 @@ the algorithm runs inside Triton (`triton/model_repository/<algo>_train`), actio
     python -m venv .venv
     .venv/bin/pip install -r requirements.txt
     .venv/bin/pip install "gymnasium[box2d]"              # optional: LunarLander, BipedalWalker
+    # requirements.txt includes gymnasium[atari] (ale-py with ROMs) for the pixel environments (ALE/Pong-v5, ...)
 
     cd ../triton && docker compose up -d && cd ../gym     # server on localhost:8001 (gRPC)
 
@@ -31,6 +32,9 @@ plus the settings that are known to work.
 - **Exports** happen on events only: training score beats `best`, `play.py --export`, `--promote`, or
   `command=export`. Exported models are loaded by the server on first request and unloaded when idle.
 - **Manifest**: `../triton/model_repository/policy_<name>/versions.json` — channels, exported versions, scores, TRT state.
+- **Inputs and action groups**: an environment's observation becomes a named input (`obs` for vectors, `frame`
+  for images, see `envs.py`) and its action space one action group (`--groups per-dim` splits a continuous
+  space into one group per dimension). Actions come back as one flat row plus the index per discrete group.
 
 ## Scripts
 
@@ -39,6 +43,7 @@ plus the settings that are known to work.
 | `run.py` | train: register → loop { act on `latest`, env.step, observe }; `--help` lists network and PPO flags |
 | `play.py` | play a channel or version greedily; `--render human\|rgb\|none`, `--video`, `--report`, `--promote`, `--export` |
 | `triton_agent.py` | the client class both use (`register`, `act`, `observe`, `report`, `promote`, `export`, `status`) |
+| `envs.py` | environment ↔ spec glue: which input an observation space becomes, Atari preprocessing, action groups, `env.step` translation |
 
 ## Inspect the server
 

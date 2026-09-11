@@ -49,6 +49,16 @@ FManipleTensor FManipleTensor::MakeBool(const FString& InName, TConstArrayView<i
 	return T;
 }
 
+FManipleTensor FManipleTensor::MakeUInt8(const FString& InName, TConstArrayView<int64> InShape, TConstArrayView<uint8> Values)
+{
+	FManipleTensor T;
+	T.Name = InName;
+	T.Shape = TArray<int64>(InShape.GetData(), InShape.Num());
+	T.Datatype = TEXT("UINT8");
+	T.Data = TArray<uint8>(Values.GetData(), Values.Num());
+	return T;
+}
+
 FManipleTensor FManipleTensor::MakeStrings(const FString& InName, TConstArrayView<FString> Strings)
 {
 	FManipleTensor T;

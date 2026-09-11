@@ -1,4 +1,6 @@
 gymnasium[classic-control]
+gymnasium[atari]   # ALE/Pong-v5 and friends (pixels); pulls ale-py with the ROMs
+opencv-python-headless   # AtariPreprocessing resizes with cv2
 tritonclient[grpc]
 numpy
 imageio[ffmpeg]   # optional, for --video

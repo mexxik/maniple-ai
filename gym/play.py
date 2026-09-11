@@ -12,8 +12,8 @@ Add --explore to sample actions like during training instead of acting greedily.
 import argparse
 import time
 
-import gymnasium as gym
 import numpy as np
+from envs import make_env, to_env_action, to_inputs
 from triton_agent import TritonAgent
 
 RENDER_MODES = {"human": "human", "rgb": "rgb_array", "none": None}
@@ -24,7 +24,7 @@ def parse_args():
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("--url", default="localhost:8001", help="Triton gRPC endpoint")
-    parser.add_argument("--env", default="CartPole-v1", help="Gymnasium environment id")
+    parser.add_argument("--env", default="CartPole-v1", help="Gymnasium environment id (ALE/... = Atari)")
     parser.add_argument("--name", default="cartpole", help="policy name on the server")
     parser.add_argument("--episodes", type=int, default=5)
     parser.add_argument(
@@ -51,18 +51,14 @@ def parse_args():
 
 def play_episode(env, agent, explore, max_steps, render, frames, fps, channel):
     """Run one episode. Returns (return, steps, served policy version)."""
-    discrete = isinstance(env.action_space, gym.spaces.Discrete)
     obs, _ = env.reset()
     episode_return = 0.0
     version = 0
 
     for step in range(1, max_steps + 1):
-        action, action_index, _, version = agent.act(obs[None], explore=explore, channel=channel)
-
-        if discrete:
-            env_action = int(action_index[0])
-        else:
-            env_action = np.clip(action[0], env.action_space.low, env.action_space.high)
+        inputs = to_inputs(np.asarray(obs)[None], env.observation_space)
+        action, action_index, _, version = agent.act(inputs, explore=explore, channel=channel)
+        env_action = to_env_action(action, action_index, env.action_space)[0]
 
         obs, reward, terminated, truncated, _ = env.step(env_action)
         episode_return += float(reward)
@@ -82,7 +78,7 @@ def main():
     args = parse_args()
     render = args.render or ("rgb" if args.video else "human")
 
-    env = gym.make(args.env, render_mode=RENDER_MODES[render])
+    env = make_env(args.env, render_mode=RENDER_MODES[render])
     agent = TritonAgent(args.url, args.name)
 
     if args.export:

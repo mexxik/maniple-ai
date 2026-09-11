@@ -8,6 +8,10 @@ No ML code runs here; PPO lives in Triton (triton/common/maniple).
 
     .venv/bin/python run.py --env CartPole-v1 --name cartpole --agents 16 --steps 8000
     .venv/bin/python run.py --env Pendulum-v1 --name pendulum --agents 16 --steps 20000
+    .venv/bin/python run.py --env ALE/Pong-v5 --name pong --agents 16 --steps 60000 --net none   # pixels
+
+Observations become the policy's inputs (a vector -> "obs", an image -> "frame", see envs.py); the action
+space becomes one action group, or one per dimension with --groups per-dim.
 """
 
 import argparse
@@ -15,6 +19,7 @@ import time
 
 import gymnasium as gym
 import numpy as np
+from envs import make_env, spec_actions, spec_inputs, to_env_action, to_inputs
 from triton_agent import TritonAgent
 
 
@@ -23,11 +28,20 @@ def parse_args():
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("--url", default="localhost:8001", help="Triton gRPC endpoint")
-    parser.add_argument("--env", default="CartPole-v1", help="Gymnasium environment id")
+    parser.add_argument("--env", default="CartPole-v1", help="Gymnasium environment id (ALE/... = Atari)")
     parser.add_argument("--name", default="cartpole", help="policy name on the server")
     parser.add_argument("--agents", type=int, default=16, help="parallel environments")
     parser.add_argument("--steps", type=int, default=3000, help="environment steps per agent")
     parser.add_argument("--no-explore", action="store_true", help="act greedily (evaluation only)")
+    parser.add_argument(
+        "--async-envs", action="store_true", help="step the environments in worker processes (Atari)"
+    )
+    parser.add_argument(
+        "--groups",
+        default="single",
+        choices=["single", "per-dim"],
+        help="continuous actions as one group, or one group per dimension (several heads)",
+    )
     parser.add_argument(
         "--center-penalty",
         type=float,
@@ -39,7 +53,7 @@ def parse_args():
     )
 
     net = parser.add_argument_group("network (see triton/common/maniple/spec.py)")
-    net.add_argument("--net", default="auto", help="auto | small | medium | large | custom")
+    net.add_argument("--net", default="auto", help="auto | small | medium | large | custom | none")
     net.add_argument("--hidden", default=None, help="layer sizes for --net custom, e.g. 512,512,256")
     net.add_argument("--activation", default="tanh", choices=["tanh", "relu", "elu", "gelu"])
     net.add_argument("--layernorm", action="store_true", help="LayerNorm after every hidden layer")
@@ -61,19 +75,6 @@ def parse_args():
 
 def make_spec(envs, args):
     """Build the AgentSpec the trainer needs from the environment's spaces and the CLI options."""
-    obs_dim = int(np.prod(envs.single_observation_space.shape))
-    space = envs.single_action_space
-
-    if isinstance(space, gym.spaces.Discrete):
-        action = {"type": "discrete", "n": int(space.n)}
-    else:
-        action = {
-            "type": "continuous",
-            "dim": int(np.prod(space.shape)),
-            "low": float(space.low.min()),
-            "high": float(space.high.max()),
-        }
-
     net = {
         "preset": "custom" if args.hidden else args.net,
         "hidden": [int(h) for h in args.hidden.split(",")] if args.hidden else [],
@@ -91,7 +92,12 @@ def make_spec(envs, args):
         "entropy_coef": args.entropy,
         "max_policy_lag": args.max_lag,
     }
-    return {"obs": {"dim": obs_dim}, "action": action, "net": net, "ppo": ppo}
+    return {
+        "inputs": spec_inputs(envs.single_observation_space),
+        "actions": spec_actions(envs.single_action_space, args.groups),
+        "net": net,
+        "ppo": ppo,
+    }
 
 
 def center_penalty(obs, coef, threshold):
@@ -99,21 +105,19 @@ def center_penalty(obs, coef, threshold):
     return coef * (obs[:, 0] / threshold) ** 2
 
 
-def to_env_action(action, action_index, action_space):
-    """Translate the server's action tensor into what env.step() expects."""
-    if action_space["type"] == "discrete":
-        return action_index
-    return np.clip(action, action_space["low"], action_space["high"])
-
-
 def main():
     args = parse_args()
 
-    envs = gym.vector.SyncVectorEnv([lambda: gym.make(args.env) for _ in range(args.agents)])
+    factories = [lambda: make_env(args.env) for _ in range(args.agents)]
+    envs = gym.vector.AsyncVectorEnv(factories) if args.async_envs else gym.vector.SyncVectorEnv(factories)
     agent = TritonAgent(args.url, args.name)
+    obs_space = envs.single_observation_space
+    act_space = envs.single_action_space
 
     # the rail the cart is allowed to reach before the episode ends (CartPole: 2.4)
-    x_threshold = float(getattr(envs.envs[0].unwrapped, "x_threshold", 2.4))
+    x_threshold = 2.4
+    if not args.async_envs:
+        x_threshold = float(getattr(envs.envs[0].unwrapped, "x_threshold", 2.4))
 
     spec = make_spec(envs, args)
     if args.resume:
@@ -139,14 +143,12 @@ def main():
     obs, _ = envs.reset(seed=0)
 
     for step in range(1, args.steps + 1):
-        obs_batch = obs.reshape(args.agents, -1).astype(np.float32)
+        inputs = to_inputs(obs, obs_space)
 
         action, action_index, logp, served_version = agent.act(
-            obs_batch, explore=not args.no_explore, channel="latest"
+            inputs, explore=not args.no_explore, channel="latest"
         )
-        next_obs, reward, terminated, truncated, _ = envs.step(
-            to_env_action(action, action_index, spec["action"])
-        )
+        next_obs, reward, terminated, truncated, _ = envs.step(to_env_action(action, action_index, act_space))
         done = np.logical_or(terminated, truncated)
 
         # the trainer learns from the shaped reward; the progress line below stays on the true one
@@ -156,7 +158,7 @@ def main():
             shaped_reward = reward - center_penalty(position, args.center_penalty, x_threshold)
 
         status = agent.observe(
-            obs=obs_batch,
+            inputs=inputs,
             action=action,
             reward=shaped_reward,
             done=done,
@@ -178,11 +180,12 @@ def main():
         if step % 100 == 0:
             recent = finished_returns[-20:]
             mean_return = np.mean(recent) if recent else float("nan")
+            elapsed = time.time() - started
             print(
                 f"step {step:5d}  served v{served_version} trained v{status['version']}  "
                 f"updates {status['updates']}  buffered {status['buffered']:5d}  stale {status['dropped_stale']}  "
                 f"episodes {len(finished_returns):4d}  mean return(last 20) {mean_return:8.2f}  "
-                f"kl {status['stats'].get('kl', 0):.4f}  {time.time() - started:5.0f}s"
+                f"kl {status['stats'].get('kl', 0):.4f}  {step * args.agents / elapsed:6.0f} steps/s  {elapsed:5.0f}s"
             )
 
 

@@ -1,17 +1,21 @@
 # ppo_infer: inference entry point. channel=latest is answered by ppo_train from its current weights;
 # best / stable / <version> are exported static models, loaded on first use and unloaded when idle.
+# Observation inputs (obs, frame, audio, text) are optional on the wire: send the ones the policy's spec declares.
 name: "ppo_infer"
 backend: "python"
 max_batch_size: 0
 input [
   { name: "name",    data_type: TYPE_STRING, dims: [ 1 ] },
-  { name: "obs",     data_type: TYPE_FP32,   dims: [ -1, -1 ] },
+  { name: "obs",     data_type: TYPE_FP32,   dims: [ -1, -1 ], optional: true },           # [N, D] vector
+  { name: "frame",   data_type: TYPE_UINT8,  dims: [ -1, -1, -1, -1 ], optional: true },   # [N, H, W, C] image
+  { name: "audio",   data_type: TYPE_FP32,   dims: [ -1, -1 ], optional: true },           # [N, S] samples
+  { name: "text",    data_type: TYPE_STRING, dims: [ -1 ], optional: true },               # [N] lines
   { name: "explore", data_type: TYPE_BOOL,   dims: [ 1 ], optional: true },
   { name: "channel", data_type: TYPE_STRING, dims: [ 1 ], optional: true }   # stable (default) | best | latest | <version>
 ]
 output [
-  { name: "action",         data_type: TYPE_FP32,   dims: [ -1, -1 ] },
-  { name: "action_index",   data_type: TYPE_INT64,  dims: [ -1 ] },
+  { name: "action",         data_type: TYPE_FP32,   dims: [ -1, -1 ] },   # [N, action_dim]: continuous values, discrete one-hots
+  { name: "action_index",   data_type: TYPE_INT64,  dims: [ -1, -1 ] },   # [N, discrete groups]
   { name: "logp",           data_type: TYPE_FP32,   dims: [ -1 ] },
   { name: "policy_version", data_type: TYPE_INT64,  dims: [ 1 ] },
   { name: "status",         data_type: TYPE_STRING, dims: [ 1 ] }

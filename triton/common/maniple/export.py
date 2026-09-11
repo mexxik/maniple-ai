@@ -1,5 +1,10 @@
 """Export a policy's actor as a static Triton model 'policy_<name>/<version>/model.onnx' (+ config.pbtxt),
-and optionally compile it to TensorRT as 'policy_<name>_trt'. Loaded on demand by <algo>_infer."""
+and optionally compile it to TensorRT as 'policy_<name>_trt'. Loaded on demand by <algo>_infer.
+
+The exported model has one input per spec input (obs, frame, ...), and outputs 'action' [N, action_dim]
+(means / logits, groups in spec order), 'log_std' [N, continuous_dim] when any group is continuous, and
+'policy_version'. The spec is written next to the model as 'policy_<name>/spec.json' so <algo>_infer knows
+the layout (which columns are which group) without asking the trainer."""
 
 from __future__ import annotations
 
@@ -13,6 +18,11 @@ import torch
 from .nets import Actor
 from .spec import AgentSpec
 
+TRITON_DTYPES = {"fp32": "TYPE_FP32", "uint8": "TYPE_UINT8", "string": "TYPE_STRING"}
+TORCH_DTYPES = {"fp32": torch.float32, "uint8": torch.uint8}
+
+SPEC_FILE = "spec.json"
+
 
 class _Exported(torch.nn.Module):
     """Actor + constant 'policy_version' output, so whoever serves the model can report which version it is."""
@@ -22,16 +32,16 @@ class _Exported(torch.nn.Module):
         self.actor = actor
         self.register_buffer("version", torch.tensor([version], dtype=torch.int64))
 
-    def forward(self, obs):
-        out = self.actor(obs)
+    def forward(self, *inputs):
+        out = self.actor(*inputs)
         outs = out if isinstance(out, tuple) else (out,)
-        return (*outs, self.version.expand(obs.shape[0]))
+        return (*outs, self.version.expand(inputs[0].shape[0]))
 
 
 CONFIG = """name: "{model}"
-platform: "onnxruntime_onnx"
+platform: "{platform}"
 max_batch_size: 1024
-input  [ {{ name: "obs",    data_type: TYPE_FP32, dims: [ {obs} ] }} ]
+input  [ {inputs} ]
 output [ {outputs} ]
 dynamic_batching {{ preferred_batch_size: [ 64, 256, 1024 ] max_queue_delay_microseconds: 500 }}
 instance_group [ {{ count: 1, kind: KIND_GPU }} ]
@@ -39,11 +49,34 @@ version_policy: {{ all: {{ }} }}
 """
 
 
-def _pin_output_dims(onnx_path: str, act_dim: int) -> None:
+def _inputs_config(spec: AgentSpec) -> str:
+    return ", ".join(
+        f'{{ name: "{i.name}", data_type: {TRITON_DTYPES[i.dtype]}, dims: [ {", ".join(str(d) for d in i.shape)} ] }}'
+        for i in spec.inputs
+    )
+
+
+def _outputs_config(spec: AgentSpec) -> str:
+    outputs = f'{{ name: "action", data_type: TYPE_FP32, dims: [ {spec.action_dim} ] }}'
+    if spec.continuous_dim > 0:
+        outputs += f', {{ name: "log_std", data_type: TYPE_FP32, dims: [ {spec.continuous_dim} ] }}'
+    outputs += ', { name: "policy_version", data_type: TYPE_INT64, dims: [ 1 ], reshape: { shape: [ ] } }'
+    return outputs
+
+
+def output_names(spec: AgentSpec) -> list[str]:
+    names = ["action"]
+    if spec.continuous_dim > 0:
+        names.append("log_std")
+    return names + ["policy_version"]
+
+
+def _pin_output_dims(onnx_path: str, spec: AgentSpec) -> None:
     """The tracer leaves the action dimension of 'log_std' symbolic ([-1, -1]); Triton then refuses the config
-    ([-1, act_dim]). Pin every non-batch output dimension to its known size."""
+    ([-1, dim]). Pin every non-batch output dimension to its known size."""
     import onnx
 
+    widths = {"action": spec.action_dim, "log_std": spec.continuous_dim}
     model = onnx.load(onnx_path)
     for output in model.graph.output:
         dims = output.type.tensor_type.shape.dim
@@ -52,7 +85,7 @@ def _pin_output_dims(onnx_path: str, act_dim: int) -> None:
                 continue  # batch stays dynamic
             if dim.dim_param:
                 dim.dim_param = ""
-                dim.dim_value = act_dim if output.name in ("action", "log_std") else 1
+                dim.dim_value = widths.get(output.name, 1)
     onnx.save(model, onnx_path)
 
 
@@ -68,21 +101,40 @@ def latest_exported_version(name: str, model_repository: str) -> int:
     return max((int(v) for v in os.listdir(d) if v.isdigit()), default=0)
 
 
-def _write_config(model_dir: str, name: str, spec: AgentSpec) -> None:
-    """Write config.pbtxt if missing or different (Triton reloads the model on a config change)."""
-    outputs = f'{{ name: "action", data_type: TYPE_FP32, dims: [ {spec.action.out_dim} ] }}'
-    if spec.action.type == "continuous":
-        outputs += f', {{ name: "log_std", data_type: TYPE_FP32, dims: [ {spec.action.out_dim} ] }}'
-    outputs += ', { name: "policy_version", data_type: TYPE_INT64, dims: [ 1 ], reshape: { shape: [ ] } }'
-    content = CONFIG.format(model=policy_model_name(name), obs=spec.obs_dim, outputs=outputs)
-
-    cfg_path = os.path.join(model_dir, "config.pbtxt")
-    if os.path.exists(cfg_path):
-        with open(cfg_path) as f:
+def _write_if_changed(path: str, content: str) -> None:
+    """Triton reloads a model on a config change, so only touch the file when the content differs."""
+    if os.path.exists(path):
+        with open(path) as f:
             if f.read() == content:
                 return
-    with open(cfg_path, "w") as f:
+    with open(path, "w") as f:
         f.write(content)
+
+
+def _write_config(model_dir: str, model: str, platform: str, spec: AgentSpec) -> None:
+    content = CONFIG.format(
+        model=model, platform=platform, inputs=_inputs_config(spec), outputs=_outputs_config(spec)
+    )
+    _write_if_changed(os.path.join(model_dir, "config.pbtxt"), content)
+
+
+def write_spec(model_dir: str, spec: AgentSpec) -> None:
+    _write_if_changed(os.path.join(model_dir, SPEC_FILE), spec.to_json())
+
+
+def read_spec(model_dir: str) -> AgentSpec | None:
+    """The layout of an exported policy; None for exports written before the file existed (v1 layout)."""
+    path = os.path.join(model_dir, SPEC_FILE)
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        return AgentSpec.from_json(f.read())
+
+
+def dummy_inputs(spec: AgentSpec, rows: int = 1) -> tuple[torch.Tensor, ...]:
+    return tuple(
+        torch.zeros(rows, *[int(d) for d in i.shape], dtype=TORCH_DTYPES[i.dtype]) for i in spec.inputs
+    )
 
 
 def export_actor(
@@ -97,27 +149,28 @@ def export_actor(
     model_dir = os.path.join(model_repository, policy_model_name(name))
     version_dir = os.path.join(model_dir, str(version))
     os.makedirs(model_dir, exist_ok=True)
-    _write_config(model_dir, name, spec)
+    _write_config(model_dir, policy_model_name(name), "onnxruntime_onnx", spec)
+    write_spec(model_dir, spec)
 
     # write to a temp dir and rename: Triton must never see a half-written version directory
     tmp = tempfile.mkdtemp(prefix=f".{version}-", dir=model_dir)
     onnx_path = os.path.join(tmp, "model.onnx")
     module = _Exported(copy.deepcopy(actor).to("cpu").eval(), version)  # never move the live model
-    outputs = (["action", "log_std"] if spec.action.type == "continuous" else ["action"]) + ["policy_version"]
+    outputs = output_names(spec)
     torch.onnx.export(
         module,
-        torch.zeros(1, spec.obs_dim),
+        dummy_inputs(spec),
         onnx_path,
-        input_names=["obs"],
+        input_names=spec.input_names,
         output_names=outputs,
-        dynamic_axes={"obs": {0: "batch"}, **{o: {0: "batch"} for o in outputs}},
+        dynamic_axes={**{i: {0: "batch"} for i in spec.input_names}, **{o: {0: "batch"} for o in outputs}},
         opset_version=17,
         dynamo=False,
     )
     if os.path.isdir(version_dir):  # never overwrite a version Triton may have loaded
         shutil.rmtree(tmp)
         raise FileExistsError(f"{version_dir} already exists")
-    _pin_output_dims(onnx_path, spec.action.out_dim)
+    _pin_output_dims(onnx_path, spec)
 
     os.chmod(tmp, 0o755)
     os.replace(tmp, version_dir)
@@ -134,19 +187,14 @@ def prune_versions(model_dir: str, keep: set[int]) -> None:
 
 # ---------------------------------------------------------------- TensorRT
 
-TRT_CONFIG = """name: "{model}"
-platform: "tensorrt_plan"
-max_batch_size: 1024
-input  [ {{ name: "obs",    data_type: TYPE_FP32, dims: [ {obs} ] }} ]
-output [ {outputs} ]
-dynamic_batching {{ preferred_batch_size: [ 64, 256, 1024 ] max_queue_delay_microseconds: 500 }}
-instance_group [ {{ count: 1, kind: KIND_GPU }} ]
-version_policy: {{ all: {{ }} }}
-"""
-
 
 def trt_model_name(name: str) -> str:
     return f"policy_{name}_trt"
+
+
+def _trt_shapes(spec: AgentSpec, rows: int) -> str:
+    """trtexec shape list: 'obs:64x32,frame:64x84x84x4'."""
+    return ",".join(f"{i.name}:{'x'.join(str(d) for d in (rows, *i.shape))}" for i in spec.inputs)
 
 
 def build_trt(
@@ -165,23 +213,18 @@ def build_trt(
 
     model_dir = os.path.join(model_repository, trt_model_name(name))
     os.makedirs(model_dir, exist_ok=True)
-    outputs = f'{{ name: "action", data_type: TYPE_FP32, dims: [ {spec.action.out_dim} ] }}'
-    if spec.action.type == "continuous":
-        outputs += f', {{ name: "log_std", data_type: TYPE_FP32, dims: [ {spec.action.out_dim} ] }}'
-    outputs += ', { name: "policy_version", data_type: TYPE_INT64, dims: [ 1 ], reshape: { shape: [ ] } }'
-    with open(os.path.join(model_dir, "config.pbtxt"), "w") as f:
-        f.write(TRT_CONFIG.format(model=trt_model_name(name), obs=spec.obs_dim, outputs=outputs))
+    _write_config(model_dir, trt_model_name(name), "tensorrt_plan", spec)
+    write_spec(model_dir, spec)
 
     tmp = tempfile.mkdtemp(prefix=f".{version}-", dir=model_dir)
     plan_path = os.path.join(tmp, "model.plan")
-    obs = spec.obs_dim
     cmd = [
         trtexec,
         f"--onnx={onnx_path}",
         f"--saveEngine={plan_path}",
-        f"--minShapes=obs:1x{obs}",
-        f"--optShapes=obs:64x{obs}",
-        f"--maxShapes=obs:1024x{obs}",
+        f"--minShapes={_trt_shapes(spec, 1)}",
+        f"--optShapes={_trt_shapes(spec, 64)}",
+        f"--maxShapes={_trt_shapes(spec, 1024)}",
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0 or not os.path.exists(plan_path):

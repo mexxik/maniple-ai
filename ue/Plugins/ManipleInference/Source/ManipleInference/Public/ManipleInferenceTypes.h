@@ -13,6 +13,8 @@ struct MANIPLEINFERENCE_API FManipleTensor
 	static FManipleTensor MakeFloat(const FString& InName, TConstArrayView<int64> InShape, TConstArrayView<float> Values);
 	static FManipleTensor MakeInt64(const FString& InName, TConstArrayView<int64> InShape, TConstArrayView<int64> Values);
 	static FManipleTensor MakeBool(const FString& InName, TConstArrayView<int64> InShape, TConstArrayView<bool> Values);
+	/** UINT8 tensor (images: "frame" [Rows, H, W, C], channels last, as captured). */
+	static FManipleTensor MakeUInt8(const FString& InName, TConstArrayView<int64> InShape, TConstArrayView<uint8> Values);
 	/** BYTES tensor of shape [Strings.Num()] (Triton STRING: 4-byte little-endian length + utf-8 per element). */
 	static FManipleTensor MakeStrings(const FString& InName, TConstArrayView<FString> Strings);
 	static FManipleTensor MakeString(const FString& InName, const FString& Value) { return MakeStrings(InName, {Value}); }

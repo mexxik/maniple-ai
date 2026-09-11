@@ -10,28 +10,100 @@
 
 // ---------- spec ----------
 
-FString FManipleAgentSpec::ToJson() const
+int32 FManipleInputSpec::Size() const
 {
-	TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+	int32 N = 1;
+	for (int32 D : Shape)
+		N *= D;
+	return N;
+}
 
-	TSharedRef<FJsonObject> Obs = MakeShared<FJsonObject>();
-	Obs->SetNumberField(TEXT("dim"), ObsDim);
-	Root->SetObjectField(TEXT("obs"), Obs);
+int32 FManipleAgentSpec::ActionDim() const
+{
+	if (!IsV2())
+		return DiscreteN > 0 ? DiscreteN : ActDim;
+	int32 N = 0;
+	for (const FManipleActionGroup& G : Actions)
+		N += G.OutDim();
+	return N;
+}
 
+int32 FManipleAgentSpec::NumDiscreteGroups() const
+{
+	if (!IsV2())
+		return DiscreteN > 0 ? 1 : 0;
+	int32 N = 0;
+	for (const FManipleActionGroup& G : Actions)
+		N += G.bDiscrete ? 1 : 0;
+	return N;
+}
+
+static TArray<TSharedPtr<FJsonValue>> IntArray(const TArray<int32>& Values)
+{
+	TArray<TSharedPtr<FJsonValue>> Out;
+	for (int32 V : Values)
+		Out.Add(MakeShared<FJsonValueNumber>(V));
+	return Out;
+}
+
+static TSharedRef<FJsonObject> ActionGroupJson(const FManipleActionGroup& G)
+{
 	TSharedRef<FJsonObject> Action = MakeShared<FJsonObject>();
-	if (DiscreteN > 0)
+	if (G.bDiscrete)
 	{
 		Action->SetStringField(TEXT("type"), TEXT("discrete"));
-		Action->SetNumberField(TEXT("n"), DiscreteN);
+		Action->SetNumberField(TEXT("n"), G.N);
 	}
 	else
 	{
 		Action->SetStringField(TEXT("type"), TEXT("continuous"));
-		Action->SetNumberField(TEXT("dim"), ActDim);
-		Action->SetNumberField(TEXT("low"), Low);
-		Action->SetNumberField(TEXT("high"), High);
+		Action->SetNumberField(TEXT("dim"), G.Dim);
+		Action->SetNumberField(TEXT("low"), G.Low);
+		Action->SetNumberField(TEXT("high"), G.High);
 	}
-	Root->SetObjectField(TEXT("action"), Action);
+	return Action;
+}
+
+FString FManipleAgentSpec::ToJson() const
+{
+	TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+
+	if (IsV2())
+	{
+		// named inputs and action groups; the trainer keeps the order given here (rows of the action tensor)
+		TSharedRef<FJsonObject> InputsObj = MakeShared<FJsonObject>();
+		for (const FManipleInputSpec& I : Inputs)
+		{
+			TSharedRef<FJsonObject> In = MakeShared<FJsonObject>();
+			In->SetArrayField(TEXT("shape"), IntArray(I.Shape));
+			In->SetStringField(TEXT("dtype"), I.Dtype);
+			if (!I.Encoder.IsEmpty())
+				In->SetStringField(TEXT("encoder"), I.Encoder);
+			if (I.Hidden.Num() > 0)
+				In->SetArrayField(TEXT("hidden"), IntArray(I.Hidden));
+			InputsObj->SetObjectField(I.Name, In);
+		}
+		Root->SetObjectField(TEXT("inputs"), InputsObj);
+
+		TArray<TSharedPtr<FJsonValue>> Groups; // a list keeps the order whatever the JSON object does
+		for (const FManipleActionGroup& G : Actions)
+		{
+			TSharedRef<FJsonObject> Group = ActionGroupJson(G);
+			Group->SetStringField(TEXT("name"), G.Name);
+			Groups.Add(MakeShared<FJsonValueObject>(Group));
+		}
+		Root->SetArrayField(TEXT("actions"), Groups);
+	}
+	else
+	{
+		TSharedRef<FJsonObject> Obs = MakeShared<FJsonObject>();
+		Obs->SetNumberField(TEXT("dim"), ObsDim);
+		Root->SetObjectField(TEXT("obs"), Obs);
+
+		const FManipleActionGroup Single = DiscreteN > 0 ? FManipleActionGroup::Discrete(TEXT("action"), DiscreteN)
+														 : FManipleActionGroup::Continuous(TEXT("action"), ActDim, Low, High);
+		Root->SetObjectField(TEXT("action"), ActionGroupJson(Single));
+	}
 
 	TSharedRef<FJsonObject> Net = MakeShared<FJsonObject>();
 	Net->SetStringField(TEXT("preset"), Hidden.Num() > 0 ? TEXT("custom") : Preset);
@@ -102,13 +174,14 @@ void FManipleTransitionBatch::Reset()
 	AgentId.Reset();
 	EpisodeId.Reset();
 	PolicyVersion.Reset();
+	for (FColumn& C : Columns)
+		C.Data.Reset();
 }
 
-void FManipleTransitionBatch::Add(TConstArrayView<float> InObs, TConstArrayView<float> InAction, float InReward, bool bDone,
-	int64 InAgentId, int64 InEpisodeId, int64 InPolicyVersion, float InLogP)
+void FManipleTransitionBatch::AddCommon(
+	TConstArrayView<float> InAction, float InReward, bool bDone, int64 InAgentId, int64 InEpisodeId, int64 InPolicyVersion, float InLogP)
 {
-	checkf(InObs.Num() == ObsDim && InAction.Num() == ActDim, TEXT("transition row size mismatch"));
-	Obs.Append(InObs.GetData(), InObs.Num());
+	checkf(InAction.Num() == ActDim, TEXT("transition action size mismatch: %d, expected %d"), InAction.Num(), ActDim);
 	Action.Append(InAction.GetData(), InAction.Num());
 	Reward.Add(InReward);
 	Done.Add(bDone);
@@ -116,6 +189,58 @@ void FManipleTransitionBatch::Add(TConstArrayView<float> InObs, TConstArrayView<
 	EpisodeId.Add(InEpisodeId);
 	PolicyVersion.Add(InPolicyVersion);
 	LogP.Add(InLogP);
+}
+
+void FManipleTransitionBatch::Add(TConstArrayView<float> InObs, TConstArrayView<float> InAction, float InReward, bool bDone,
+	int64 InAgentId, int64 InEpisodeId, int64 InPolicyVersion, float InLogP)
+{
+	checkf(Columns.Num() == 0, TEXT("a batch uses Add (one obs vector) or AddRow (named inputs), not both"));
+	checkf(InObs.Num() == ObsDim, TEXT("transition obs size mismatch: %d, expected %d"), InObs.Num(), ObsDim);
+	Obs.Append(InObs.GetData(), InObs.Num());
+	AddCommon(InAction, InReward, bDone, InAgentId, InEpisodeId, InPolicyVersion, InLogP);
+}
+
+void FManipleTransitionBatch::AddRow(TConstArrayView<FManipleTensor> InInputs, TConstArrayView<float> InAction, float InReward, bool bDone,
+	int64 InAgentId, int64 InEpisodeId, int64 InPolicyVersion, float InLogP)
+{
+	checkf(Obs.Num() == 0, TEXT("a batch uses Add (one obs vector) or AddRow (named inputs), not both"));
+	if (Columns.Num() == 0)
+	{
+		for (const FManipleTensor& T : InInputs)
+			Columns.Add({T.Name, T.Datatype, T.Shape, {}});
+	}
+	checkf(InInputs.Num() == Columns.Num(), TEXT("every row must carry the same named inputs"));
+	for (int32 i = 0; i < InInputs.Num(); ++i)
+	{
+		const FManipleTensor& T = InInputs[i];
+		FColumn& C = Columns[i];
+		checkf(T.Name == C.Name && T.Datatype == C.Datatype && T.Shape == C.RowShape, TEXT("input '%s': row layout changed"), *T.Name);
+		C.Data.Append(T.Data);
+	}
+	AddCommon(InAction, InReward, bDone, InAgentId, InEpisodeId, InPolicyVersion, InLogP);
+}
+
+TArray<FManipleTensor> FManipleTransitionBatch::InputTensors() const
+{
+	const int32 N = Num();
+	TArray<FManipleTensor> Out;
+	if (Columns.Num() == 0)
+	{
+		const int64 ObsShape[2] = {N, ObsDim};
+		Out.Add(FManipleTensor::MakeFloat(TEXT("obs"), ObsShape, Obs));
+		return Out;
+	}
+	for (const FColumn& C : Columns)
+	{
+		FManipleTensor T;
+		T.Name = C.Name;
+		T.Datatype = C.Datatype;
+		T.Shape.Add(N);
+		T.Shape.Append(C.RowShape);
+		T.Data = C.Data;
+		Out.Add(MoveTemp(T));
+	}
+	return Out;
 }
 
 // ---------- client ----------
@@ -215,11 +340,9 @@ void FManipleAgentClient::Observe(const FManipleTransitionBatch& B, FStatusCallb
 	const int32 N = B.Num();
 	if (N == 0)
 		return;
-	const int64 ObsShape[2] = {N, B.ObsDim};
 	const int64 ActShape[2] = {N, B.ActDim};
 	const int64 Flat[1] = {N};
-	TArray<FManipleTensor> Inputs;
-	Inputs.Add(FManipleTensor::MakeFloat(TEXT("obs"), ObsShape, B.Obs));
+	TArray<FManipleTensor> Inputs = B.InputTensors();
 	Inputs.Add(FManipleTensor::MakeFloat(TEXT("action"), ActShape, B.Action));
 	Inputs.Add(FManipleTensor::MakeFloat(TEXT("reward"), Flat, B.Reward));
 	Inputs.Add(FManipleTensor::MakeBool(TEXT("done"), Flat, B.Done));
@@ -264,18 +387,26 @@ void FManipleAgentClient::Act(
 	TConstArrayView<float> Obs, int32 Rows, int32 ObsDim, bool bExplore, const FString& Channel, FActCallback OnDone)
 {
 	checkf(Obs.Num() == Rows * ObsDim, TEXT("act: obs has %d floats, expected %d x %d"), Obs.Num(), Rows, ObsDim);
+	const int64 ObsShape[2] = {Rows, ObsDim};
+	TArray<FManipleTensor> Inputs;
+	Inputs.Add(FManipleTensor::MakeFloat(TEXT("obs"), ObsShape, Obs));
+	Act(MoveTemp(Inputs), Rows, bExplore, Channel, MoveTemp(OnDone));
+}
+
+void FManipleAgentClient::Act(TArray<FManipleTensor> Inputs, int32 Rows, bool bExplore, const FString& Channel, FActCallback OnDone)
+{
+	for (const FManipleTensor& T : Inputs)
+		checkf(T.Shape.Num() > 0 && T.Shape[0] == Rows, TEXT("act: input '%s' has %lld rows, expected %d"), *T.Name,
+			T.Shape.Num() > 0 ? T.Shape[0] : 0, Rows);
 	const bool bLatest = Channel.IsEmpty() || Channel.Equals(TEXT("latest"), ESearchCase::IgnoreCase);
 	const FString Model = bLatest ? TrainModel : InferModel;
 
-	const int64 ObsShape[2] = {Rows, ObsDim};
 	const int64 One[1] = {1};
-	TArray<FManipleTensor> Inputs;
-	Inputs.Add(FManipleTensor::MakeString(TEXT("name"), Name));
+	Inputs.Insert(FManipleTensor::MakeString(TEXT("name"), Name), 0);
 	if (bLatest)
-		Inputs.Add(FManipleTensor::MakeString(TEXT("command"), TEXT("act")));
+		Inputs.Insert(FManipleTensor::MakeString(TEXT("command"), TEXT("act")), 1);
 	else
-		Inputs.Add(FManipleTensor::MakeString(TEXT("channel"), Channel));
-	Inputs.Add(FManipleTensor::MakeFloat(TEXT("obs"), ObsShape, Obs));
+		Inputs.Insert(FManipleTensor::MakeString(TEXT("channel"), Channel), 1);
 	Inputs.Add(FManipleTensor::MakeBool(TEXT("explore"), One, {bExplore}));
 
 	const FString What = Model + TEXT(" act");
@@ -307,7 +438,10 @@ void FManipleAgentClient::Act(
 				}
 				A.Action = TArray<float>(Action->AsFloats());
 				if (Index)
+				{
 					A.ActionIndex = TArray<int64>(Index->AsInt64s());
+					A.NumIndexGroups = Index->Shape.Num() == 2 ? (int32)Index->Shape[1] : (Rows > 0 ? A.ActionIndex.Num() / Rows : 0);
+				}
 				if (LogP)
 					A.LogP = TArray<float>(LogP->AsFloats());
 				if (Version && Version->AsInt64s().Num() > 0)
@@ -320,9 +454,18 @@ void FManipleAgentClient::Act(
 
 FManipleActResult FManipleAgentClient::ActSync(TConstArrayView<float> Obs, int32 Rows, int32 ObsDim, bool bExplore, const FString& Channel)
 {
+	checkf(Obs.Num() == Rows * ObsDim, TEXT("act: obs has %d floats, expected %d x %d"), Obs.Num(), Rows, ObsDim);
+	const int64 ObsShape[2] = {Rows, ObsDim};
+	TArray<FManipleTensor> Inputs;
+	Inputs.Add(FManipleTensor::MakeFloat(TEXT("obs"), ObsShape, Obs));
+	return ActSync(MoveTemp(Inputs), Rows, bExplore, Channel);
+}
+
+FManipleActResult FManipleAgentClient::ActSync(TArray<FManipleTensor> Inputs, int32 Rows, bool bExplore, const FString& Channel)
+{
 	TSharedRef<FManipleActResult> Result = MakeShared<FManipleActResult>();
 	TSharedRef<bool> Done = MakeShared<bool>(false);
-	Act(Obs, Rows, ObsDim, bExplore, Channel,
+	Act(MoveTemp(Inputs), Rows, bExplore, Channel,
 		[Result, Done](const FManipleActResult& A)
 		{
 			*Result = A;

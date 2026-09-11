@@ -12,6 +12,7 @@ import json
 import os
 import threading
 import time
+import traceback
 
 import numpy as np
 import torch
@@ -27,7 +28,7 @@ class Policy:
     def __init__(self, name: str, spec: AgentSpec, registry: PolicyRegistry):
         self.name, self.spec, self.reg = name, spec, registry
         self.algo: Algorithm = registry.algorithm_cls(spec, registry.device)
-        self.buffer = TransitionBuffer(spec.obs_dim, spec.action.out_dim)
+        self.buffer = TransitionBuffer(spec)
         self.model_dir = os.path.join(registry.model_repository, policy_model_name(name))
         self.versions = VersionTracker(
             model_dir=self.model_dir,
@@ -58,35 +59,46 @@ class Policy:
     # ------------------------------------------------------------------ acting (channel 'latest')
 
     @torch.no_grad()
-    def act(self, obs: np.ndarray, explore: bool):
-        """obs [N, obs_dim] -> (action, action_index, logp) with the current weights."""
+    def act(self, inputs: dict[str, np.ndarray], explore: bool):
+        """inputs {name: [N, ...]} -> (action row, action_index, logp) with the current weights."""
+        self._check_inputs(inputs)
         actor = self.algo.actor()
         with self.weights_lock:
             actor.eval()
-            x = torch.as_tensor(obs, device=self.reg.device)
-            dist = actor.distribution(x)
-            if actor.continuous:
-                sample = dist.sample() if explore else dist.mean
-                logp = dist.log_prob(sample).sum(-1)
-                action = sample
-                index = torch.full((obs.shape[0],), -1, dtype=torch.int64, device=x.device)
-            else:
-                index = dist.sample() if explore else dist.probs.argmax(-1)
-                logp = dist.log_prob(index)
-                action = torch.nn.functional.one_hot(index, dist.probs.shape[-1]).float()
+            tensors = {name: torch.as_tensor(array, device=self.reg.device) for name, array in inputs.items()}
+            dist = actor.distribution(tensors)
+            action = dist.sample() if explore else dist.mode()
+            logp = dist.log_prob(action)
+            index = dist.indices(action)
         return (
             action.cpu().numpy().astype(np.float32),
             index.cpu().numpy().astype(np.int64),
             logp.cpu().numpy().astype(np.float32),
         )
 
+    def _check_inputs(self, inputs: dict[str, np.ndarray]) -> None:
+        rows = None
+        for i in self.spec.inputs:
+            array = inputs.get(i.name)
+            if array is None:
+                raise ValueError(
+                    f"input '{i.name}' missing (this policy takes: {', '.join(self.spec.input_names)})"
+                )
+            if list(array.shape[1:]) != [int(d) for d in i.shape]:
+                raise ValueError(
+                    f"input '{i.name}' is {list(array.shape)}, expected [N, {', '.join(map(str, i.shape))}]"
+                )
+            if rows is not None and array.shape[0] != rows:
+                raise ValueError("inputs have different row counts")
+            rows = array.shape[0]
+
     # ------------------------------------------------------------------ data in
 
-    def observe(self, obs, action, reward, done, agent_id, episode_id, policy_version, logp=None) -> int:
-        if obs is None or action is None or reward is None or done is None:
-            raise ValueError("observe needs obs, action, reward, done")
+    def observe(self, inputs, action, reward, done, agent_id, episode_id, policy_version, logp=None) -> int:
+        if not inputs or action is None or reward is None or done is None:
+            raise ValueError("observe needs the policy's inputs, action, reward, done")
         n = self.buffer.add(
-            obs,
+            inputs,
             action,
             reward,
             done,
@@ -111,8 +123,16 @@ class Policy:
                 continue
 
             trajectories = self.buffer.take()
-            with self.weights_lock:
-                self.last_stats = self.algo.update(trajectories)
+            try:
+                with self.weights_lock:
+                    self.last_stats = self.algo.update(trajectories)
+            except Exception as e:  # noqa: BLE001 - a bad batch must not kill the trainer (the buffer would grow forever)
+                self.last_stats = {"error": f"{type(e).__name__}: {e}"}
+                print(
+                    f"[maniple] policy '{self.name}': update failed, batch dropped ({self.last_stats['error']})"
+                )
+                traceback.print_exc()
+                continue
             self.updates += 1
             self.version += 1
             self.versions.set_latest(self.version)
